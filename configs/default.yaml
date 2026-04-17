@@ -1,0 +1,30 @@
+universe:
+  source: wikipedia
+
+start: "2014-01-01"
+end: "today"
+
+features:
+  mom_12_1: 1.0
+  reversal_5d: 1.0
+  volume_shock: 0.5
+
+liquidity:
+  min_dollar_vol_usd: 5000000
+
+membership:
+  point_in_time: true   # mask signal to the S&P 500 on each date (reduces survivorship bias)
+
+neutralize:
+  sector: true
+  size: true            # regress out log(20d dollar volume) as a size proxy
+
+smoothing:
+  halflife_days: 0      # 0 = off; e.g. 5 dampens day-to-day signal churn
+
+backtest:
+  n_deciles: 10
+  cost_bps: 5
+  return_field: adj_close
+  weighting: decile              # decile | decile_sticky | signal_weighted
+  exit_n_deciles: 5              # only used if weighting=decile_sticky (top 20% exit band)

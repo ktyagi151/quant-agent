@@ -1,0 +1,18 @@
+# Sticky deciles — enter top 10%, hold while in top 20%.
+universe: {source: wikipedia}
+start: "2014-01-01"
+end: "today"
+features:
+  mom_12_1: 1.0
+  reversal_5d: 1.0
+  volume_shock: 0.5
+liquidity: {min_dollar_vol_usd: 5000000}
+membership: {point_in_time: true}
+neutralize: {sector: true, size: true}
+smoothing: {halflife_days: 0}
+backtest:
+  n_deciles: 10
+  cost_bps: 5
+  return_field: adj_close
+  weighting: decile_sticky
+  exit_n_deciles: 5   # top/bottom 20% hold band
