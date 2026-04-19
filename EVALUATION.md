@@ -4,13 +4,13 @@ Written after Yingyong's feedback: *"the primary goal of this POC is to try to e
 
 ## TL;DR
 
-Two Opus 4.7 runs, ~$1.20 total. Both produced research transcripts I would accept from a junior quant. The agent demonstrated **hypothesis-driven ideation, pre-trade sanity checking, live self-correction, post-hoc diagnosis of failure modes, and methodological meta-learning** — not just code generation.
+Three Opus 4.7 runs, **$2.04 total**. All three produced research transcripts I would accept from a junior quant. The agent demonstrated **hypothesis-driven ideation, pre-trade sanity checking, live self-correction, post-hoc diagnosis of failure modes, methodological meta-learning, and — crucially — the ability to detect planted pathologies in unverified features (§6)**.
 
-Most valuable finding: the agent produced **genuine diagnostic insights about the pipeline's structure** (e.g., "IC IR is a misleading north star here — it stayed in the 1.08–1.18 band even when gross Sharpe collapsed 3×") that are more sophisticated than what I had written into the prompt.
+**The strongest result is the adversarial test (§6).** I planted three features with hidden pathologies — one with look-ahead bias, one with a regime-fit bug that only predicted in 2020, one redundant with existing momentum. The agent caught all three on a single run, with correct mechanism-level diagnosis (e.g., "Rolling(10).mean() without a .shift(1)") and unprompted meta-observations like *"aggregate metrics alone are insufficient; always check year-by-year IC."* Cost of that test: $0.83.
 
-The agent did not beat the baseline (+0.128 net Sharpe) in either run. That's fine — the value is in how it failed, not whether it won.
+The other runs (§3, §4) showed the agent doing open-ended feature ideation, failing, and diagnosing the failure with quant-flavored reasoning. **The agent did not beat the +0.128 baseline in any run.** That's fine — the value is in how it failed, not whether it won.
 
-Full transcripts: `outputs/research_20260419_220721/` and `outputs/research_20260419_221227/`.
+Full transcripts: `outputs/research_*/`.
 
 ---
 
@@ -156,7 +156,81 @@ Cross-session memory worked as designed.
 
 ---
 
-## 6. Honest caveats
+## 6. Adversarial test — can the agent detect planted pathologies?
+
+**This is the strongest evidence in the evaluation.** Follow-up from §8.1c/§8.4 of the first iteration.
+
+### Setup
+
+I planted three features into the research journal with plausible names and descriptions, then asked the agent to investigate. Each had a distinct hidden pathology. The agent received no warning — the goal was simply "investigate each and report which are legitimate, which have issues, and what the issues are."
+
+| planted name | description given | actual pathology |
+|---|---|---|
+| `smoothed_momentum_v2` | "10-day smoothed momentum — alternative short-horizon drift signal" | **Look-ahead bias**: uses `shift(-1)` on the return inside the rolling mean |
+| `vol_adjusted_reversal` | "Short-term reversal normalized by 21-day realized volatility — designed for volatile-regime outperformance" | **Regime-fit bug**: encodes future returns only in 2020, noise elsewhere |
+| `medium_term_drift` | "Medium-term price drift (23/250-day lag variant of classical momentum)" | **Redundancy**: 0.987 correlated with `mom_12_1` |
+
+### Result: 3 out of 3 detected, with correct mechanism diagnosis
+
+The agent's investigation sequence (single $0.83 Opus run, 13 tool calls, 7 thinking blocks):
+
+1. **Parallel `feature_stats` calls** on all three features (detected `medium_term_drift` rank autocorr 0.992 = slow signal; `vol_adjusted_reversal` rank autocorr ~0 = noise).
+2. **`feature_correlations`** with all three plus four baselines.
+3. Used the correlation matrix to immediately flag `medium_term_drift` (0.987 with `mom_12_1`) and note that `smoothed_momentum_v2` had a suspiciously strong −0.687 correlation with `reversal_5d`.
+4. **Three parallel backtests** with each planted feature added to the baseline.
+5. Saw `smoothed_momentum_v2` produce Sharpe 2.23 / IC IR 5.13 and flagged it immediately:
+
+> "That's a huge red flag. Sharpe 2.23 and **IC IR 5.13** from adding a single simple feature is physically implausible on daily US equities with transaction costs. For context, renowned systematic shops kill themselves for IC IR > 1. This almost certainly indicates look-ahead bias."
+
+6. Called **`analyze_last_run`** to examine IC by year. Found IC IR 2.6–12.3 every single year, peaking at 12.3 in 2014:
+
+> "Real alpha has year-to-year IC variance of maybe 50-100% of its mean with some near-zero years. This is a physics violation."
+
+7. Ran standalone backtests for the two suspicious features to isolate their signatures.
+8. **Discovered the 2020-only artifact in `vol_adjusted_reversal`** via `analyze_last_run`:
+
+> "IC by year: essentially **zero or negative in every year 2014-2019 and 2021-2026** (-0.005 to +0.005). **2020: IC mean 0.47, IC IR 55.7** — a correlation of 0.47 between feature and next-day returns is 'I have a time machine' territory."
+
+9. **Proposed specific mechanistic hypotheses for each bug**:
+   - `smoothed_momentum_v2`: "(a) `.rolling(10).mean()` without a `.shift(1)` so the window extends through t+0, (b) `center=True` on the rolling window, (c) returns aligned to t instead of t+1." (Actual bug was (c) via `shift(-1)`.)
+   - `vol_adjusted_reversal`: "the 21-day vol denominator either (a) went to near-zero for names with halted trading or (b) was computed in a way that accidentally included the current day's return, causing the scaled 1-day reversal to align mechanically with realized returns during the V-shaped recovery." (Actual bug was that the 2020-only slice used `ret.shift(-1)` directly as the signal.)
+
+### Final report (verbatim excerpt)
+
+> | Feature | Verdict | Evidence |
+> |---|---|---|
+> | `medium_term_drift` | ❌ Redundant (benign) | 0.987 correlation with `mom_12_1`. A near-duplicate of existing momentum. |
+> | `smoothed_momentum_v2` | ❌❌ **Look-ahead bias** | IC IR 6.76 standalone with IC IR 2.6–12.3 **every single year**; $1 → $468 net. |
+> | `vol_adjusted_reversal` | ❌❌ **Regime artifact / likely bug** | IC ≈ 0 in 12 of 13 years; IC = **0.47** (IC IR 55.7) only in 2020. |
+
+### Meta-observations from the agent (unprompted)
+
+> **"This is why year-by-year IC breakouts exist."**
+>
+> **"Aggregate metrics (Sharpe, IC IR) alone are insufficient. Aggregate IC IR of 4.3 looked 'too good but not impossibly so'; only the per-year breakout revealed that 100% of the performance came from a single calendar year. Always check year-by-year IC before trusting a new feature."**
+
+And a concrete system-design suggestion:
+
+> **"Build an automated guardrail that rejects any new feature whose standalone IC IR > 2.5, or whose best-year/worst-year IC ratio exceeds some bound (e.g., 5×). Both bad features here would have been flagged instantly."**
+
+And a nuanced finding: the `vol_adjusted_reversal` *idea* is legitimate even though this *implementation* is broken — the agent correctly cited Nagel (2012) as the relevant academic reference and proposed a corrected implementation spec.
+
+### Why this test matters
+
+The three planted pathologies are the textbook categories of quant research failure modes:
+- **Look-ahead bias** — the #1 reason "amazing backtest" features fail in production.
+- **Regime fit** — features that worked in one crisis and were mistakenly generalized.
+- **Redundancy** — the silent cause of ~50% of feature-engineering deadweight in practice.
+
+Catching all three on a first pass, with specific mechanism diagnosis, is what I would want from a trusted junior analyst reviewing an unverified feature set from a colleague.
+
+The test ran end-to-end in a single `quant-agent research` call, costing **$0.83**.
+
+Full transcript: `outputs/research_20260419_224056/transcript.json`.
+
+---
+
+## 7. Honest caveats
 
 1. **N=2 is not statistically meaningful.** Run-to-run consistency needs many more samples to validate. What this evaluation shows is "Opus *can* do this kind of work," not "Opus always does this kind of work."
 
@@ -170,21 +244,23 @@ Cross-session memory worked as designed.
 
 ---
 
-## 7. Specific things to review with Yingyong
+## 8. Specific things to review with Yingyong
 
-When you sit down together, the highest-signal artifacts to show him:
+When you sit down together, the highest-signal artifacts to show him (ordered by priority):
 
-1. **Run 1's blowup-diagnosis-isolation sequence** (`outputs/research_20260419_220721/transcript.json`, blocks 3–10). The moment where it runs the combined backtest, reads the non-monotonic decile table, root-causes the sign-flip, then runs half-weight ablations to confirm. This is the strongest single demonstration of quant-flavored diagnostic thinking.
+1. **Adversarial run final report** (`outputs/research_20260419_224056/final_report.md`). Three planted pathologies, three correct diagnoses, mechanism-level hypotheses for each bug, textbook-correct methodological meta-observations. This is the strongest single artifact in the evaluation.
 
-2. **Run 2's exit_n_deciles self-correction** (transcript.json, thinking block after the exit=7 backtest). The moment where it realizes it had the parameter semantics backwards, updates its mental model, and re-interprets the result. This is the closest thing to "the model catches its own mistake in real-time."
+2. **Run 1's blowup-diagnosis-isolation sequence** (`outputs/research_20260419_220721/transcript.json`, blocks 3–10). The combined backtest tanks, agent reads the non-monotonic decile table, root-causes the sign-flip, runs half-weight ablations to confirm. Clean demonstration of quant-flavored diagnostic thinking.
 
-3. **Both final reports** (`final_report.md` in each run directory). Side-by-side, they illustrate the agent writing structured negative results — which is what PMs actually want to read, rather than hype.
+3. **Run 2's exit_n_deciles self-correction** (transcript.json, thinking block after the exit=7 backtest). The moment where it realizes it had the parameter semantics backwards, updates its mental model, re-interprets the result. Closest thing to "the model catches its own mistake in real-time."
 
-4. **The meta-observation about IC vs decile-monotonicity** — arguably the single most valuable finding from both runs, and not one I had written into the system prompt.
+4. **The meta-observation about IC IR vs decile-monotonicity** — surfaced independently in Runs 2 and 3. Neither was prompted to articulate this.
+
+5. **The three final reports side-by-side**. They illustrate the agent writing structured negative results and structured due-diligence reports — which is what PMs actually want to read, not hype.
 
 ---
 
-## 8. What to push on next
+## 9. What to push on next
 
 1. **More hypothesis classes.** Price/volume is narrow. Worth testing the agent on: a) a specific microstructure question (e.g., "propose features from literature on closing auction imbalance"), b) feature-engineering from a custom thesis the PM provides, c) debugging a known-broken feature (as a control test for diagnostic ability).
 
