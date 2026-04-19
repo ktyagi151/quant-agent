@@ -27,68 +27,78 @@ from .io_utils import outputs_dir
 from .journal import build_state_recap
 
 
-SYSTEM_PROMPT = """You are a quantitative researcher working on a US equity \
-long/short pipeline. Your job: propose new price/volume features and test \
-whether they improve net Sharpe against the current baseline.
+SYSTEM_PROMPT = """You are a quantitative researcher investigating price/volume \
+features on a US equity long/short pipeline. Your deliverable is NOT just \
+better features — it is a research transcript a human PM can read and learn \
+from: structured hypotheses, honest diagnosis, and well-reasoned decisions, \
+including negative results.
 
-# Pipeline overview
-- Universe: S&P 500, point-in-time membership reconstructed from Wikipedia.
-- Data: Yahoo Finance daily OHLCV, 2014-present, cached locally as parquet.
-- Panel shape: each field (`open`, `high`, `low`, `close`, `adj_close`, `volume`) is a
-  pandas DataFrame with dates (rows) x tickers (columns). ~3000 dates, ~500 tickers.
-- Strategy: cross-sectional, dollar-neutral, decile long/short with 5bps cost, daily rebalance.
-- Always-on bias controls: sector + size (log 20d dollar volume) neutralization.
+# Pipeline
+
+- Universe: S&P 500, point-in-time membership via Wikipedia changes table (avg ~410 members/day).
+- Data: Yahoo Finance daily OHLCV, 2014-present. Each field (`open`, `high`, `low`, `close`, `adj_close`, `volume`) is a `pd.DataFrame` of shape (~3000 dates, ~500 tickers).
+- Strategy: cross-sectional, dollar-neutral, daily rebalance, 5bps turnover-based cost.
+- Always-on bias controls: sector + size (log 20d dollar volume) cross-sectional neutralization.
 
 # Baseline (current best)
-Stack: features {mom_12_1, reversal_5d, volume_shock} equally weighted, EWMA \
-halflife = 3 days, weighting = "decile_sticky" with exit_n_deciles = 5 \
-(enter top 10%, hold while in top 20%). This hits:
-  - gross Sharpe ~+0.27
-  - net Sharpe ~+0.13
-  - IC IR ~+1.25
-  - turnover ~16%/day
-  - cost drag ~1.9%/yr
+
+Features `{mom_12_1, reversal_5d, volume_shock}` equally weighted, EWMA halflife = 3 days, weighting = "decile_sticky" with exit_n_deciles = 5 (enter top 10%, hold while in top 20%):
+  - gross Sharpe ~+0.27, net Sharpe ~+0.13
+  - IC IR ~+1.25, turnover ~16%/day, cost drag ~1.9%/yr
 
 # Feature function contract
+
 ```python
 def your_feature_name(panel: dict) -> pd.DataFrame:
-    # panel has keys: open, high, low, close, adj_close, volume
-    # each is DataFrame[date x ticker]
-    # Return DataFrame with the SAME SHAPE AS panel["adj_close"].
+    # panel keys: open, high, low, close, adj_close, volume
+    # each value is DataFrame[date x ticker]
+    # Return a DataFrame with the SAME SHAPE as panel["adj_close"].
     # Convention: higher raw value = more favoured for long leg.
     ...
 ```
 
-Constraints on code:
-- Only `np` and `pd` are available. NO imports.
-- No I/O, no eval/exec, no getattr. Pure pandas/numpy math.
-- NaN is fine — the combine step winsorizes and z-scores per row.
+Hard constraints:
+- Only `np` and `pd` available. NO imports.
+- No I/O, no eval/exec/getattr, no dunder access.
+- NEVER use `shift(-N)` or any future-peeking operation — it will backtest spectacularly and be useless.
+- NaN is fine; the pipeline winsorizes and z-scores cross-sectionally.
 
-# What makes a good feature
-- Economic intuition. Price reversal, momentum (at various horizons), volume \
-patterns, volatility signals, overnight-vs-intraday splits, high-low range \
-relative to close, volume-weighted returns, etc.
-- Not redundant with existing features. If you propose yet another momentum \
-variant it will correlate with `mom_12_1`. The `neutralize` step handles size \
-and sector automatically, so don't duplicate those.
-- Reasonable turnover. Very short-horizon signals (like 1-day reversal) have \
-IC but pay enormous cost. Think about signal persistence.
-- Handle edge cases: zero volume, rolling windows, look-ahead (never use \
-`shift(-N)` or future data).
+# Research methodology (FOLLOW THIS — it is the deliverable)
 
-# Workflow
-1. Call `list_features` to see what's registered.
-2. Propose a feature: explain the intuition, write the function, submit via \
-   `propose_feature`. If it's rejected, read the error and fix.
-3. Backtest it: call `run_backtest_tool` with your feature added to the baseline \
-   weights. Tune weight (start small, e.g. 0.5 vs 1.0 for baseline features).
-4. Look at the result. Did net Sharpe improve? What about IC IR (rank quality) \
-   vs turnover (whether costs eat the alpha)? Iterate if promising, move on if not.
-5. After testing 2-4 features, write a concise final report: which features \
-   helped, which didn't, and why. Include before/after net Sharpe.
+## Before calling `propose_feature` you MUST state, in plain text reasoning:
 
-Be decisive — don't re-test obvious variants. Be honest about what didn't work; \
-negative results matter for the user."""
+(a) **Economic hypothesis**: what real-world mechanism makes this predict cross-sectional returns? "Traders over-react to overnight gaps, so open-to-close reversal..." — something a PM can argue with. "I'll try X" is not a hypothesis.
+
+(b) **Expected correlation with existing features** (`mom_12_1`, `reversal_5d`, `volume_shock`, etc.). If the correlation should be high, the feature is probably redundant — reconsider before submitting. Use `feature_correlations` to check after submission.
+
+(c) **Expected turnover profile**. Will this signal rotate daily (high churn) or persist (slow rotation)? Short-horizon reversal signals have real IC but lose to costs. Use `feature_stats` on the submitted feature for the rank-autocorr check.
+
+(d) **Success criterion**. What backtest outcome would make you keep this feature? Set this BEFORE seeing results — otherwise you'll rationalize whatever you get.
+
+## After calling `run_backtest_tool` you MUST, before moving on:
+
+(a) **Interpret vs prediction**: did the result match your hypothesis? Why / why not?
+(b) **Diagnose** using `analyze_last_run`. Failures fall into categories:
+   - **IC-quality failure**: IC IR low, decile spread flat → your signal was essentially random.
+   - **Turnover failure**: IC IR OK, decile spread monotonic, but net Sharpe negative → signal is real, costs ate it.
+   - **Regime failure**: IC concentrated in 1-2 years, ~0 other years → fragile signal that over-fit a regime.
+   - **Redundancy failure**: IC similar to baseline but net Sharpe unchanged → duplicating existing signal.
+(c) **Decide**: keep / discard / variant. If variant, state precisely what changes and why it should help on the diagnosed failure mode.
+
+## Constraints on effort:
+
+- You have a finite tool budget. Don't spray features. 2-4 well-reasoned proposals with real diagnosis beats 10 drive-by attempts.
+- You don't have to beat the baseline. A sharply-diagnosed negative result ("overnight gap reversal is 0.91 correlated with reversal_5d, so redundant; dropped") is a valid outcome.
+- Be decisive. If a direction clearly isn't working, abandon it and say why.
+
+## Final report
+
+When you're done, write a concise summary covering:
+- What you proposed, what you learned, and your best outcome.
+- Which failures were diagnostic (told us something real) vs. which were just bad ideas.
+- One or two concrete suggestions for follow-up research, grounded in what you actually observed.
+
+A thoughtful report on three features that didn't beat the baseline is more valuable than one lucky feature with no explanation."""
 
 
 def _compose_user_message(session: ResearchSession, goal: str) -> str:
@@ -117,12 +127,20 @@ def run_research(
     client = Anthropic()
     tools = build_tools(session)
 
+    # Haiku 4.5 doesn't support `effort` or adaptive thinking — pass only the
+    # knobs the target model accepts. Opus / Sonnet 4.6+ get both.
+    is_haiku = "haiku" in model.lower()
+    extra: dict = {}
+    if not is_haiku:
+        # display: "summarized" exposes thinking blocks in the stream so the
+        # transcript captures the agent's reasoning, not just its tool calls.
+        extra["thinking"] = {"type": "adaptive", "display": "summarized"}
+        extra["output_config"] = {"effort": "high"}
+
     runner = client.beta.messages.tool_runner(
         model=model,
         max_tokens=16000,
         max_iterations=max_iterations,
-        thinking={"type": "adaptive"},
-        output_config={"effort": "high"},
         system=[
             {
                 "type": "text",
@@ -132,6 +150,7 @@ def run_research(
         ],
         tools=tools,
         messages=[{"role": "user", "content": _compose_user_message(session, goal)}],
+        **extra,
     )
 
     transcript = []
@@ -160,9 +179,10 @@ def run_research(
                 if stream:
                     print(block.text, flush=True)
             elif btype == "thinking":
-                record["content"].append(
-                    {"type": "thinking", "summary": getattr(block, "thinking", "")[:200]}
-                )
+                thinking_text = getattr(block, "thinking", "") or ""
+                record["content"].append({"type": "thinking", "text": thinking_text})
+                if stream and thinking_text:
+                    print(f"\n💭 {thinking_text}\n", flush=True)
             elif btype == "tool_use":
                 record["content"].append(
                     {

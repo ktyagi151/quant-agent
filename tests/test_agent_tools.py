@@ -56,7 +56,9 @@ def test_run_backtest_with_baseline_features(tiny_session):
 
 
 def test_propose_feature_via_tool_runs_it(tiny_session):
-    _list, propose, run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    propose = next(t for t in tools if t.name == "propose_feature")
+    run_bt = next(t for t in tools if t.name == "run_backtest_tool")
     code = (
         "def range_feature(panel):\n"
         "    high_low = (panel['high'] - panel['low']) / panel['close']\n"
@@ -77,7 +79,8 @@ def test_propose_feature_via_tool_runs_it(tiny_session):
 
 
 def test_propose_feature_unsafe_rejected(tiny_session):
-    _list, propose, _run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    propose = next(t for t in tools if t.name == "propose_feature")
     msg = propose(
         name="bad",
         python_code="import os\ndef bad(p): return p['adj_close']",
@@ -88,7 +91,8 @@ def test_propose_feature_unsafe_rejected(tiny_session):
 
 
 def test_propose_feature_wrong_shape_rejected(tiny_session):
-    _list, propose, _run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    propose = next(t for t in tools if t.name == "propose_feature")
     # Returns a Series, not a DataFrame.
     msg = propose(
         name="wrong_shape",
@@ -100,7 +104,8 @@ def test_propose_feature_wrong_shape_rejected(tiny_session):
 
 
 def test_list_features_returns_sorted_json(tiny_session):
-    list_feats, _propose, _run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    list_feats = next(t for t in tools if t.name == "list_features")
     out = json.loads(list_feats())
     assert isinstance(out, list)
     assert "mom_12_1" in out
@@ -108,7 +113,8 @@ def test_list_features_returns_sorted_json(tiny_session):
 
 
 def test_run_backtest_unknown_feature_errors(tiny_session):
-    _list, _propose, run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    run_bt = next(t for t in tools if t.name == "run_backtest_tool")
     msg = run_bt(
         feature_weights={"nonexistent_feature": 1.0},
         halflife_days=3,
@@ -117,6 +123,75 @@ def test_run_backtest_unknown_feature_errors(tiny_session):
     )
     assert "ERROR" in msg
     assert "nonexistent_feature" in msg
+
+
+# ----- introspection tools --------------------------------------------------
+
+
+def test_analyze_last_run_before_any_run(tiny_session):
+    tools = build_tools(tiny_session)
+    analyze = next(t for t in tools if t.name == "analyze_last_run")
+    result = json.loads(analyze())
+    assert result.get("error") == "no runs recorded yet"
+
+
+def test_analyze_last_run_returns_full_diagnostics(tiny_session):
+    tools = build_tools(tiny_session)
+    run_bt = next(t for t in tools if t.name == "run_backtest_tool")
+    analyze = next(t for t in tools if t.name == "analyze_last_run")
+
+    run_bt(
+        feature_weights={"mom_12_1": 1.0, "reversal_5d": 1.0},
+        halflife_days=3,
+        weighting="decile_sticky",
+        exit_n_deciles=3,
+    )
+    result = json.loads(analyze())
+    assert "per_decile_annual_return" in result
+    assert "per_decile_sharpe" in result
+    assert "ic_by_year" in result
+    assert "equity_year_end" in result
+    assert "summary" in result
+
+
+def test_feature_correlations_includes_self_pair(tiny_session):
+    tools = build_tools(tiny_session)
+    corr_tool = next(t for t in tools if t.name == "feature_correlations")
+    result = json.loads(corr_tool(feature_names=["mom_12_1", "reversal_5d"]))
+    assert "correlation_matrix" in result
+    # A feature correlates 1.0 with itself.
+    diag = result["correlation_matrix"]["mom_12_1"]["mom_12_1"]
+    assert abs(diag - 1.0) < 1e-6
+
+
+def test_feature_correlations_unknown_feature(tiny_session):
+    tools = build_tools(tiny_session)
+    corr_tool = next(t for t in tools if t.name == "feature_correlations")
+    result = json.loads(corr_tool(feature_names=["ghost_feature"]))
+    assert "error" in result
+
+
+def test_feature_stats_shape_and_fields(tiny_session):
+    tools = build_tools(tiny_session)
+    stats = next(t for t in tools if t.name == "feature_stats")
+    result = json.loads(stats(feature_name="mom_12_1"))
+    for key in [
+        "feature",
+        "n_obs",
+        "nan_fraction",
+        "q01",
+        "median",
+        "q99",
+        "rank_autocorr_1d_mean",
+    ]:
+        assert key in result, f"missing {key} in {result}"
+
+
+def test_feature_stats_unknown_feature(tiny_session):
+    tools = build_tools(tiny_session)
+    stats = next(t for t in tools if t.name == "feature_stats")
+    result = json.loads(stats(feature_name="does_not_exist"))
+    assert "error" in result
 
 
 # ----- journal integration --------------------------------------------------
@@ -132,7 +207,8 @@ def test_session_persists_features_to_journal(tiny_session, tmp_path):
 
     journal = Journal(root=tmp_path / "r")
     _inject_journal(tiny_session, journal)
-    _list, propose, _run_bt = build_tools(tiny_session)
+    tools = build_tools(tiny_session)
+    propose = next(t for t in tools if t.name == "propose_feature")
 
     code = "def hl_range(panel): return -(panel['high'] - panel['low']) / panel['close']\n"
     msg = propose(name="hl_range", python_code=code, description="negative HL range")

@@ -292,6 +292,12 @@ def compare(configs_dir: str, limit: int | None) -> None:
 @click.option("--goal", required=True, help="What you want the agent to investigate.")
 @click.option("--max-iter", default=20, type=int, help="Max tool-use iterations.")
 @click.option("--model", default="claude-opus-4-7", help="Anthropic model ID.")
+@click.option(
+    "--cheap",
+    is_flag=True,
+    default=False,
+    help="Override --model with claude-haiku-4-5 for ~5x cheaper iteration (lower intelligence ceiling).",
+)
 @click.option("--limit", type=int, default=None, help="Limit universe size (for fast iteration).")
 @click.option(
     "--fresh",
@@ -299,7 +305,7 @@ def compare(configs_dir: str, limit: int | None) -> None:
     default=False,
     help="Ignore the research journal — start from baseline only (for ablations).",
 )
-def research(goal: str, max_iter: int, model: str, limit: int | None, fresh: bool) -> None:
+def research(goal: str, max_iter: int, model: str, cheap: bool, limit: int | None, fresh: bool) -> None:
     """Run the LLM research agent against the cached pipeline.
 
     Requires ANTHROPIC_API_KEY in the environment. The agent can propose new
@@ -312,10 +318,13 @@ def research(goal: str, max_iter: int, model: str, limit: int | None, fresh: boo
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise click.ClickException("ANTHROPIC_API_KEY not set in environment.")
 
+    if cheap:
+        model = "claude-haiku-4-5"
+
     from .agent import run_research, save_research_run
     from .agent_tools import ResearchSession
 
-    click.echo(f"loading research session (limit={limit}, fresh={fresh})...")
+    click.echo(f"loading research session (limit={limit}, fresh={fresh}, model={model})...")
     session = ResearchSession.from_cache(limit=limit, journal=False if fresh else True)
     click.echo(
         f"session ready: {len(session.panel['adj_close'].columns)} tickers, "

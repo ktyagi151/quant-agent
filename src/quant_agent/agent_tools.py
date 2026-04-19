@@ -20,6 +20,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 from anthropic import beta_tool
 
@@ -32,6 +33,21 @@ from . import universe as uni_mod
 from .backtest import run_backtest
 from .journal import Journal
 from .sandbox import UnsafeCodeError, exec_feature
+
+
+@dataclass
+class RunArtifacts:
+    """Per-run DataFrames kept in memory so the agent can inspect its own runs."""
+
+    run_id: str | None
+    signal: pd.DataFrame
+    fwd_ret: pd.DataFrame
+    weights: pd.DataFrame
+    net_returns: pd.Series
+    gross_returns: pd.Series
+    per_decile: pd.DataFrame
+    summary: dict
+    config: dict
 
 
 @dataclass
@@ -50,6 +66,10 @@ class ResearchSession:
     proposed_feature_source: dict[str, str] = field(default_factory=dict)
     journal: Journal | None = None
     journal_load_warnings: list[str] = field(default_factory=list)
+    # Ring buffer of recent run artifacts (signal + returns etc.) so
+    # `analyze_last_run` and friends don't need to recompute.
+    recent_runs: list["RunArtifacts"] = field(default_factory=list)
+    recent_runs_max: int = 5
 
     @classmethod
     def from_cache(
@@ -211,24 +231,135 @@ class ResearchSession:
             weighting=weighting,
             exit_n_deciles=exit_n_deciles,
         )
-        ic = met.information_coefficient(signal, prices.pct_change().shift(-1))
+        fwd_ret = prices.pct_change().shift(-1)
+        ic = met.information_coefficient(signal, fwd_ret)
         summary = met.summary(res.returns, turnover=res.turnover)
         summary.update(met.ic_summary(ic))
         gross = met.summary(res.gross_returns)
         summary["gross_sharpe"] = gross["sharpe"]
         summary["gross_ann_return"] = gross["ann_return"]
         summary["cost_drag_ann"] = gross["ann_return"] - summary["ann_return"]
-        summary["config"] = {
+        config = {
             "feature_weights": feature_weights,
             "halflife_days": halflife_days,
             "weighting": weighting,
             "exit_n_deciles": exit_n_deciles,
         }
+        summary["config"] = config
+
+        run_id: str | None = None
         if self.journal is not None:
-            run_id = self.journal.record_run(summary["config"], summary)
+            run_id = self.journal.record_run(config, summary)
             summary["run_id"] = run_id
+
+        # Keep the full artifacts so introspection tools can examine the run.
+        artifact = RunArtifacts(
+            run_id=run_id,
+            signal=signal,
+            fwd_ret=fwd_ret.reindex_like(signal),
+            weights=res.weights,
+            net_returns=res.returns,
+            gross_returns=res.gross_returns,
+            per_decile=res.per_decile_returns,
+            summary=summary,
+            config=config,
+        )
+        self.recent_runs.append(artifact)
+        # Ring buffer.
+        if len(self.recent_runs) > self.recent_runs_max:
+            self.recent_runs = self.recent_runs[-self.recent_runs_max:]
+
         self.history.append(summary)
         return summary
+
+    # ----- introspection --------------------------------------------------
+
+    def last_run(self) -> "RunArtifacts | None":
+        return self.recent_runs[-1] if self.recent_runs else None
+
+    def analyze_last_run(self) -> dict:
+        """Return per-decile spread + IC by year + cumulative equity for the last run."""
+        art = self.last_run()
+        if art is None:
+            return {"error": "no runs recorded yet"}
+
+        per_decile_ann = (art.per_decile.mean() * 252).round(4)
+        per_decile_sharpe = (
+            art.per_decile.mean() / art.per_decile.std().replace(0, np.nan) * np.sqrt(252)
+        ).round(3)
+
+        # IC by year.
+        ic_series = met.information_coefficient(art.signal, art.fwd_ret)
+        ic_by_year = {}
+        for year, grp in ic_series.dropna().groupby(ic_series.dropna().index.year):
+            mean = float(grp.mean())
+            std = float(grp.std(ddof=0))
+            ir = mean / std * np.sqrt(252) if std > 0 else float("nan")
+            ic_by_year[int(year)] = {
+                "ic_mean": round(mean, 4),
+                "ic_ir": round(ir, 3),
+                "n": int(grp.size),
+            }
+
+        # Equity curve: final value + max drawdown by year.
+        eq = (1 + art.net_returns.fillna(0)).cumprod()
+        eq_year_end = eq.resample("YE").last()
+
+        return {
+            "run_id": art.run_id,
+            "config": art.config,
+            "summary": {k: art.summary.get(k) for k in
+                        ["sharpe", "gross_sharpe", "ic_mean", "ic_ir", "avg_turnover", "max_drawdown"]},
+            "per_decile_annual_return": per_decile_ann.to_dict(),
+            "per_decile_sharpe": per_decile_sharpe.to_dict(),
+            "ic_by_year": ic_by_year,
+            "equity_year_end": {str(k.year): round(float(v), 4) for k, v in eq_year_end.items()},
+        }
+
+    def feature_correlations(self, names: list[str]) -> dict:
+        """Pearson correlations between raw feature values (flattened panel)."""
+        # Need features computed.
+        dfs: dict[str, pd.DataFrame] = {}
+        for n in names:
+            if n not in self.feature_fns:
+                return {"error": f"unknown feature '{n}'"}
+            dfs[n] = self._feature(n)
+        # Flatten each to 1-D, aligning on (date, ticker).
+        stacked = {n: df.stack(future_stack=True) for n, df in dfs.items()}
+        combined = pd.concat(stacked, axis=1).dropna()
+        if combined.empty:
+            return {"error": "no overlapping non-NaN observations"}
+        corr = combined.corr().round(3)
+        return {
+            "n_observations": int(len(combined)),
+            "correlation_matrix": corr.to_dict(),
+        }
+
+    def feature_stats(self, name: str) -> dict:
+        """Distribution + autocorrelation summary for a single feature."""
+        if name not in self.feature_fns:
+            return {"error": f"unknown feature '{name}'"}
+        df = self._feature(name)
+        flat = df.stack(future_stack=True).dropna()
+        if flat.empty:
+            return {"error": "feature is entirely NaN"}
+        q = flat.quantile([0.01, 0.25, 0.5, 0.75, 0.99])
+        nan_frac = 1 - len(flat) / (df.shape[0] * df.shape[1])
+        # Temporal autocorrelation of the per-ticker rank — how fast does this signal rotate?
+        ranks = df.rank(axis=1, pct=True)
+        lag1_autocorr_per_ticker = ranks.apply(lambda s: s.autocorr(lag=1), axis=0)
+        return {
+            "feature": name,
+            "n_obs": int(len(flat)),
+            "nan_fraction": round(float(nan_frac), 4),
+            "q01": round(float(q.loc[0.01]), 6),
+            "q25": round(float(q.loc[0.25]), 6),
+            "median": round(float(q.loc[0.5]), 6),
+            "q75": round(float(q.loc[0.75]), 6),
+            "q99": round(float(q.loc[0.99]), 6),
+            "rank_autocorr_1d_mean": round(float(lag1_autocorr_per_ticker.mean()), 3),
+            "rank_autocorr_1d_median": round(float(lag1_autocorr_per_ticker.median()), 3),
+        }
 
 
 # ----- Tool factory ---------------------------------------------------------
@@ -317,4 +448,62 @@ def build_tools(session: ResearchSession) -> list:
             return f"ERROR: {type(e).__name__}: {e}"
         return json.dumps(summary, indent=2, default=float)
 
-    return [list_features, propose_feature, run_backtest_tool]
+    @beta_tool
+    def analyze_last_run() -> str:
+        """Diagnose the most recent backtest.
+
+        Returns per-decile annualized returns + Sharpes, IC broken out by year
+        (catches regime-dependent performance), and year-end cumulative equity.
+        Use this AFTER a run_backtest_tool call — before proposing another
+        feature — to understand WHY the run did what it did:
+          * monotonic decile spread → signal rank-orders correctly
+          * IC concentrated in 1-2 years → regime-dependent (fragile)
+          * top decile + bottom decile both positive → signal not differentiating
+          * equity climbs then collapses → structural break
+
+        Returns JSON. No arguments (always analyzes the most recent run).
+        """
+        result = session.analyze_last_run()
+        return json.dumps(result, indent=2, default=float)
+
+    @beta_tool
+    def feature_correlations(feature_names: list) -> str:
+        """Pearson correlations between raw feature values (flattened across dates+tickers).
+
+        Use this BEFORE proposing a feature to check whether your proposed
+        variant is redundant with something already in the registry. A
+        correlation above ~0.85 usually means the new feature is duplicating
+        an existing one and won't add information after z-scoring.
+
+        Args:
+            feature_names: List of feature names to correlate. Include your
+                proposed feature plus 3-5 existing baselines you suspect overlap.
+        """
+        result = session.feature_correlations(list(feature_names))
+        return json.dumps(result, indent=2, default=float)
+
+    @beta_tool
+    def feature_stats(feature_name: str) -> str:
+        """Distribution + rank-autocorrelation summary for one feature.
+
+        Use this to sanity-check a proposed feature BEFORE running a full
+        backtest. What to look for:
+          * nan_fraction > 0.5 → feature sparse / broken on many names
+          * q01 == q99 → degenerate (mostly a single value); won't differentiate
+          * rank_autocorr_1d_mean < 0.3 → very noisy day-to-day; high turnover
+          * rank_autocorr_1d_mean > 0.95 → too slow; essentially a level
+
+        Args:
+            feature_name: Feature to inspect.
+        """
+        result = session.feature_stats(feature_name)
+        return json.dumps(result, indent=2, default=float)
+
+    return [
+        list_features,
+        propose_feature,
+        run_backtest_tool,
+        analyze_last_run,
+        feature_correlations,
+        feature_stats,
+    ]
