@@ -4,7 +4,7 @@ Written after Yingyong's feedback: *"the primary goal of this POC is to try to e
 
 ## TL;DR
 
-**Six Opus 4.7 research runs + one Opus reviewer run across seven distinct capability dimensions. $3.43 total spend** (of a $5 budget). Each produced a research transcript I would accept from a junior quant.
+**Seven Opus 4.7 research runs + two Opus reviewer runs across eight distinct capability dimensions. $4.23 total spend** (of a $5 budget). Each run produced a research transcript I would accept from a junior quant.
 
 | # | Dimension tested | Finding |
 |---|---|---|
@@ -14,17 +14,19 @@ Written after Yingyong's feedback: *"the primary goal of this POC is to try to e
 | **§7 Run 4** | Literature-thesis operationalization | Given F&P BAB reference, pre-registered predictions, discovered U-shaped decile pattern, cited Ang et al. |
 | **§8 Run 5** | Experiment-design / multi-step investigation | Planned IC-decay protocol before executing; found the strategy is cost-bound, not signal-bound |
 | **§9 Run 6** | Harder code (non-trivial linear algebra) | Vectorized residualized idio-vol feature via `Var(resid) = Var(r)·(1-Corr²)`; diagnosed "content without tradability" smile failure mode |
-| **§10 Run 7** | Reviewer meta-agent (grading 6 prior runs) | Honest per-run grades; identified a "lesson post-mortem, not prophylactic" recurring failure; produced actionable "trust/gate" list for a PM |
+| **§10 Run 7** | Reviewer meta-agent (grading prior runs) | Honest per-run grades; identified a "lesson post-mortem, not prophylactic" recurring failure; produced actionable "trust/gate" list for a PM |
+| **§11 Run 8** | Self-calibration loop (compounding infra) | New `record_prediction` tool + auto-resolution; agent documented two systematic biases in its own forecasting with concrete corrections for future researchers |
 
-**The strongest results are §6, §7, §9, and §10.**
+**The strongest results are §6, §7, §9, §10, and §11.**
 - §6: objective ground truth, agent got it right.
 - §7: simulates the actual PM-in-the-loop workflow.
 - §9: demonstrates implementation sophistication + unprompted failure-mode naming.
-- §10: the reviewer is the evaluation of the evaluation — it hunted for real patterns and found them.
+- §10: the reviewer meta-agent hunts for real patterns and finds them.
+- §11: the calibration loop turns forecast errors into permanent empirical priors the next researcher inherits.
 
-**The agent did not beat the +0.128 baseline in any run.** That's the right outcome — the value is in how it thought, not whether it won. Three academic references were cited across Runs 4 + 6 + 9 (Frazzini-Pedersen 2014, Ang-Hodrick-Xing-Zhang 2006, Bali-Cakici-Whitelaw 2011), each used load-bearingly.
+**The agent did not beat the +0.128 baseline in any run.** That's the right outcome — the value is in how it thought, not whether it won. **Four academic references** were cited load-bearingly across Runs 4, 6, and 8: Frazzini-Pedersen 2014, Ang-Hodrick-Xing-Zhang 2006, Bali-Cakici-Whitelaw 2011, George-Hwang 2004.
 
-Full transcripts: `outputs/research_*/`. Reviewer output: [`REVIEW.md`](REVIEW.md).
+Full transcripts: `outputs/research_*/`. Reviewer output (now over 7 runs): [`REVIEW.md`](REVIEW.md).
 
 ---
 
@@ -477,7 +479,86 @@ Full output: [`REVIEW.md`](REVIEW.md) (85 lines). Supporting artifacts: `outputs
 
 ---
 
-## 11. Honest caveats
+## 11. Run 8 — self-calibration loop (cross-session forecast-tracking)
+
+**Testing whether building infrastructure for metacognition changes what the agent does.** This is the first `§13` follow-up from the prior iteration that produces compounding rather than one-shot value.
+
+### What was built
+
+A new `calibration.py` module + two tools (`record_prediction`, `calibration_report`) + auto-resolution hooks on the three introspection tools. When the agent makes a prediction (*"correlation with mom_12_1 in [0.3, 0.6]"*), it gets stored as pending; when the matching tool is called, the system compares observed-to-predicted automatically, marks hit/miss, and records the directional error. Summary statistics are included in the state recap for future runs.
+
+Six resolved-prediction types in v1: `correlation`, `rank_autocorr`, `ic_ir`, `net_sharpe`, `gross_sharpe`, `turnover`.
+
+### How the agent used it
+
+Opus run 8, $0.44, proposed `pct_off_52w_high` (George & Hwang 2004 anchoring). Made **6 numeric pre-observation predictions** with one-sentence rationales (5 before running a tool; 1 before the backtest).
+
+Outcomes:
+
+| prediction | range | actual | verdict |
+|---|---|---|---|
+| `corr(pct_off_52w_high, mom_12_1)` | [0.35, 0.65] | 0.42 | ✓ hit |
+| `corr(pct_off_52w_high, reversal_5d)` | [-0.10, 0.20] | -0.20 | ✗ miss low |
+| `corr(pct_off_52w_high, price_range_norm)` | [-0.15, 0.15] | 0.00 | ✓ hit |
+| `rank_autocorr(pct_off_52w_high)` | [0.96, 0.99] | 0.97 | ✓ hit |
+| `turnover(baseline+52w_high)` | [0.22, 0.30] | 0.155 | ✗ miss low |
+| `net_sharpe(baseline+52w_high)` | [0.05, 0.22] | -0.271 | ✗ miss low |
+
+3/6 hit rate. The three misses were concentrated in the outcome-level predictions (turnover, net_sharpe, and the short-horizon correlation); the structural predictions (rank autocorr, bulk correlation with the dominant analogue) were hit.
+
+### The meta-analysis the agent produced unprompted
+
+After reading its own calibration report, the agent wrote:
+
+> "Two systematic biases I've now documented:
+>
+> **1. I'm over-optimistic on net Sharpe when I have a plausible economic story.** Predicted [0.05, 0.22], delivered –0.27. The missing reasoning step: 'IC IR ≈ baseline + lower turnover → Sharpe ≥ baseline' ignores *tail crowding*. **Correction for next researcher:** when adding a feature correlated >0.35 with an existing feature in the *same direction* (both long-favouring trend), widen the downside of your net_sharpe prior to include a 'tail crowding' failure mode — at least 0.25 Sharpe below baseline.
+>
+> **2. I under-estimate signed correlation magnitudes when two features share a slow price-level component.** The pct_off_52w_high / reversal_5d correlation at –0.20 surprised me because I was thinking about horizon separation, not the fact that 'near 52w high' almost tautologically implies recent positive returns, which is exactly what reversal_5d inverts. **Correction:** when one feature is level-like (long horizon, autocorr >0.9), check its short-horizon derivative implications before predicting correlation with any short-horizon feature."
+
+And it diagnosed a **new failure mode** that had been lurking across the runs:
+
+> "Moderate bulk correlation can coexist with very high tail correlation, and for a decile-based strategy it's the tails that determine P&L."
+
+This is precisely the Run 1 "raw orthogonality does not imply portfolio complementarity" lesson — but now crystallized into a *rule* the agent wrote into the research journal for future sessions to consult.
+
+### Cross-session effect (caught by the re-run reviewer)
+
+The reviewer re-run over all 7 Opus runs — now including the calibration session — surfaced a bias **using the calibration data itself as evidence**:
+
+> "**Consistently predicts correlations too extreme (too positive or too negative in magnitude).** Run 4 predicted 0.85–0.95 |corr|, got 0.63. Run 7 self-reported correlation mean signed miss of –0.22. *This is a documented bias now.*"
+
+That phrasing — "this is a documented bias now" — is what the calibration system produces over many sessions: ex-ante intuitions that cumulate into ex-post priors.
+
+### What this unlocks (and what it doesn't)
+
+**Unlocks**: a working feedback loop from forecast → observation → bias → future prior. The infrastructure is cheap (one API call's worth of tool schemas) and the evidence it accumulates is permanent (jsonl on disk, included in state recap). Future runs see:
+
+```
+Calibration track record (10 resolved predictions):
+  - correlation: 2/4 hit rate (50%) (you tend to UNDER-estimate by -0.217 on average)
+  - gross_sharpe: 1/1 hit rate (100%)
+  - ic_ir: 2/2 hit rate (100%)
+  - net_sharpe: 0/1 hit rate (0%) (you tend to OVER-estimate by -0.406 on average)
+  - rank_autocorr: 1/2 hit rate (50%) (you tend to OVER-estimate by -0.242 on average)
+  - turnover: 0/1 hit rate (0%) (you tend to OVER-estimate by -0.105 on average)
+```
+
+**Does not unlock**: magical prediction accuracy. Only 3/6 of the agent's predictions hit, and the biases it documented remain biases of the next run unless the agent reads the state recap carefully and adjusts. What the system guarantees is *visibility* of systematic error — not correction.
+
+**Cost to generate 10 calibration data points**: $0.48 combined across the Haiku smoke + Opus test run. Cumulative calibration data grows per run at essentially zero marginal cost; the recap is in the user message, not the system prompt.
+
+### Implementation notes
+
+- Auto-resolution is implemented in the session's `feature_correlations`, `feature_stats`, and `run` methods — the agent doesn't have to do anything special after making a prediction, the next tool call resolves.
+- State recap is appended to the user message (not the system prompt), so adding calibration context doesn't invalidate the prompt cache.
+- 12 new unit tests; all 78 tests pass.
+
+Full transcript: `outputs/research_20260420_014025/`. Updated reviewer: [`REVIEW.md`](REVIEW.md).
+
+---
+
+## 12. Honest caveats
 
 1. **N=2 is not statistically meaningful.** Run-to-run consistency needs many more samples to validate. What this evaluation shows is "Opus *can* do this kind of work," not "Opus always does this kind of work."
 
@@ -491,7 +572,7 @@ Full output: [`REVIEW.md`](REVIEW.md) (85 lines). Supporting artifacts: `outputs
 
 ---
 
-## 12. Specific things to review with Yingyong
+## 13. Specific things to review with Yingyong
 
 When you sit down together, the highest-signal artifacts to show him (ordered by priority):
 
@@ -511,7 +592,7 @@ When you sit down together, the highest-signal artifacts to show him (ordered by
 
 ---
 
-## 13. What to push on next
+## 14. What to push on next
 
 1. **More hypothesis classes.** Price/volume is narrow. Worth testing the agent on: a) a specific microstructure question (e.g., "propose features from literature on closing auction imbalance"), b) feature-engineering from a custom thesis the PM provides, c) debugging a known-broken feature (as a control test for diagnostic ability).
 

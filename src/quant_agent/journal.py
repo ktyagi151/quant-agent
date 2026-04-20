@@ -322,4 +322,16 @@ def build_state_recap(journal: Journal, max_features: int = 10, max_top_runs: in
         "you have a distinctly new variant, and explain why a previously-weak feature "
         "should work now."
     )
+
+    # Calibration track record (if populated).
+    try:
+        from .calibration import CalibrationStore, build_calibration_recap
+
+        cal_recap = build_calibration_recap(CalibrationStore.default())
+        if cal_recap:
+            lines.append("")
+            lines.append(cal_recap)
+    except Exception:  # noqa: BLE001 — defensive; missing store shouldn't kill the recap
+        pass
+
     return "\n".join(lines)

@@ -31,6 +31,7 @@ from . import neutralize as neut_mod
 from . import signals as sig_mod
 from . import universe as uni_mod
 from .backtest import run_backtest
+from .calibration import CalibrationStore
 from .journal import Journal
 from .sandbox import UnsafeCodeError, exec_feature
 
@@ -66,6 +67,7 @@ class ResearchSession:
     proposed_feature_source: dict[str, str] = field(default_factory=dict)
     journal: Journal | None = None
     journal_load_warnings: list[str] = field(default_factory=list)
+    calibration: CalibrationStore | None = None
     # Ring buffer of recent run artifacts (signal + returns etc.) so
     # `analyze_last_run` and friends don't need to recompute.
     recent_runs: list["RunArtifacts"] = field(default_factory=list)
@@ -116,6 +118,9 @@ class ResearchSession:
         else:
             j = journal
 
+        # Calibration store shares the journal's root so it's naturally co-located.
+        cal = CalibrationStore.default() if j is not None else None
+
         feature_fns = dict(feat_mod.FEATURES)
         feature_cache = dict(baseline_feats)
         proposed: dict[str, str] = {}
@@ -148,6 +153,7 @@ class ResearchSession:
             proposed_feature_source=proposed,
             journal=j,
             journal_load_warnings=warnings,
+            calibration=cal,
         )
 
     # ------------------------------------------------------------------
@@ -252,6 +258,15 @@ class ResearchSession:
             run_id = self.journal.record_run(config, summary)
             summary["run_id"] = run_id
 
+        # Auto-resolve any pending ic_ir / turnover / sharpe predictions.
+        resolved = []
+        if self.calibration is not None:
+            resolved = self.calibration.resolve_backtest(summary, run_id=run_id)
+        summary["calibration_resolved"] = [
+            {"type": r["type"], "actual": r["actual"], "in_range": r["in_range"]}
+            for r in resolved
+        ]
+
         # Keep the full artifacts so introspection tools can examine the run.
         artifact = RunArtifacts(
             run_id=run_id,
@@ -330,9 +345,19 @@ class ResearchSession:
         if combined.empty:
             return {"error": "no overlapping non-NaN observations"}
         corr = combined.corr().round(3)
+        matrix = corr.to_dict()
+
+        # Auto-resolve pending correlation predictions.
+        resolved = []
+        if self.calibration is not None:
+            resolved = self.calibration.resolve_correlations(matrix)
         return {
             "n_observations": int(len(combined)),
-            "correlation_matrix": corr.to_dict(),
+            "correlation_matrix": matrix,
+            "calibration_resolved": [
+                {"pair": r["key"], "actual": r["actual"], "in_range": r["in_range"]}
+                for r in resolved
+            ],
         }
 
     def feature_stats(self, name: str) -> dict:
@@ -348,7 +373,7 @@ class ResearchSession:
         # Temporal autocorrelation of the per-ticker rank — how fast does this signal rotate?
         ranks = df.rank(axis=1, pct=True)
         lag1_autocorr_per_ticker = ranks.apply(lambda s: s.autocorr(lag=1), axis=0)
-        return {
+        stats = {
             "feature": name,
             "n_obs": int(len(flat)),
             "nan_fraction": round(float(nan_frac), 4),
@@ -360,6 +385,14 @@ class ResearchSession:
             "rank_autocorr_1d_mean": round(float(lag1_autocorr_per_ticker.mean()), 3),
             "rank_autocorr_1d_median": round(float(lag1_autocorr_per_ticker.median()), 3),
         }
+        resolved = []
+        if self.calibration is not None:
+            resolved = self.calibration.resolve_feature_stats(name, stats)
+        stats["calibration_resolved"] = [
+            {"type": r["type"], "actual": r["actual"], "in_range": r["in_range"]}
+            for r in resolved
+        ]
+        return stats
 
 
 # ----- Tool factory ---------------------------------------------------------
@@ -499,6 +532,73 @@ def build_tools(session: ResearchSession) -> list:
         result = session.feature_stats(feature_name)
         return json.dumps(result, indent=2, default=float)
 
+    @beta_tool
+    def record_prediction(predictions: list) -> str:
+        """Commit to one or more pre-observation forecasts.
+
+        Call this BEFORE the tool call that will observe the quantity you're
+        predicting. Each prediction specifies a type, a key identifying the
+        thing being predicted, and a [low, high] range. After you run the
+        corresponding tool (feature_correlations / feature_stats /
+        run_backtest_tool), pending predictions auto-resolve against the
+        observed values and your calibration track record is updated.
+
+        Supported types (v1):
+          * "correlation"   — key: [feature_a, feature_b]; resolved by feature_correlations
+          * "rank_autocorr" — key: feature_name; resolved by feature_stats
+          * "ic_ir"         — key: short config label; resolved by next run_backtest_tool
+          * "net_sharpe"    — key: short config label; resolved by next run_backtest_tool
+          * "gross_sharpe"  — key: short config label; resolved by next run_backtest_tool
+          * "turnover"      — key: short config label; resolved by next run_backtest_tool
+
+        Use this when you have a specific prior you want to test against
+        reality. The goal is not to be correct — it is to calibrate your
+        forecasting error over many runs. Hit rates in state recaps will
+        show where your priors are systematically off.
+
+        Args:
+            predictions: list of dicts, each with keys:
+              type (str), key (str or list[str]), low (float), high (float),
+              note (str, optional — one sentence on the prior).
+        """
+        if session.calibration is None:
+            return "NO_CALIBRATION_STORE: predictions are not being tracked in this session."
+        if not isinstance(predictions, list) or not predictions:
+            return "ERROR: predictions must be a non-empty list"
+        ids: list[str] = []
+        for p in predictions:
+            if not isinstance(p, dict):
+                return f"ERROR: each prediction must be a dict, got {type(p).__name__}"
+            try:
+                uid = session.calibration.record(
+                    type=str(p["type"]),
+                    key=p["key"],
+                    low=float(p["low"]),
+                    high=float(p["high"]),
+                    note=str(p.get("note", "")),
+                )
+                ids.append(uid)
+            except (KeyError, ValueError, TypeError) as e:
+                return f"ERROR recording prediction {p}: {type(e).__name__}: {e}"
+        return f"RECORDED: {len(ids)} prediction(s) pending. IDs: {ids}"
+
+    @beta_tool
+    def calibration_report() -> str:
+        """Show the current session's calibration track record.
+
+        Returns a JSON summary: total resolved predictions, per-type hit rates
+        and mean directional miss, and the most recent resolved predictions.
+        Use this to check whether your priors tend to systematically
+        over-estimate or under-estimate a given quantity.
+
+        No arguments.
+        """
+        if session.calibration is None:
+            return json.dumps({"error": "no calibration store in this session"})
+        summary = session.calibration.summary()
+        summary["recent_resolved"] = session.calibration.recent_resolved(8)
+        return json.dumps(summary, indent=2, default=str)
+
     return [
         list_features,
         propose_feature,
@@ -506,4 +606,6 @@ def build_tools(session: ResearchSession) -> list:
         analyze_last_run,
         feature_correlations,
         feature_stats,
+        record_prediction,
+        calibration_report,
     ]

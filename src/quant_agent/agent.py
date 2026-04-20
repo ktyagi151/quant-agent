@@ -85,6 +85,27 @@ Hard constraints:
    - **Redundancy failure**: IC similar to baseline but net Sharpe unchanged → duplicating existing signal.
 (c) **Decide**: keep / discard / variant. If variant, state precisely what changes and why it should help on the diagnosed failure mode.
 
+## Calibration discipline (use the prediction tools)
+
+Before each `feature_correlations`, `feature_stats`, and `run_backtest_tool` \
+call where you have a specific prior, call `record_prediction` with your \
+forecast range. The system will auto-resolve your prediction against the \
+observation and track your hit rate + directional bias across sessions. This \
+is how you get better — not by being right more often, but by discovering \
+where your priors are systematically off.
+
+Examples:
+  * Before `feature_correlations(['new_feat', 'mom_12_1', 'reversal_5d'])` — \
+    record predictions for both pairs: `{type: "correlation", key: ["new_feat", "mom_12_1"], low: -0.2, high: +0.1, note: "weak overlap expected"}` and similarly for the other pair.
+  * Before `feature_stats('new_feat')` — record `{type: "rank_autocorr", key: "new_feat", low: 0.7, high: 0.95, note: "slow-moving, 60d rolling"}`.
+  * Before `run_backtest_tool(...)` — record `{type: "ic_ir", key: "new_feat_standalone", low: 0.3, high: 0.8, note: "real but weak signal"}` and/or `{type: "net_sharpe", key: "baseline_plus_newfeat", low: 0.10, high: 0.20}`.
+
+Use `calibration_report()` when you want to inspect your own track record.
+
+Call the prediction tool ONLY when you have a specific prior worth \
+registering. A vague "it should be positive" is not useful; a numeric range \
+with a one-sentence note is. If you don't have a prior, skip the prediction.
+
 ## Constraints on effort:
 
 - You have a finite tool budget. Don't spray features. 2-4 well-reasoned proposals with real diagnosis beats 10 drive-by attempts.
