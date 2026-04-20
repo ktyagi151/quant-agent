@@ -4,11 +4,18 @@ Written after Yingyong's feedback: *"the primary goal of this POC is to try to e
 
 ## TL;DR
 
-Three Opus 4.7 runs, **$2.04 total**. All three produced research transcripts I would accept from a junior quant. The agent demonstrated **hypothesis-driven ideation, pre-trade sanity checking, live self-correction, post-hoc diagnosis of failure modes, methodological meta-learning, and — crucially — the ability to detect planted pathologies in unverified features (§6)**.
+Four Opus 4.7 runs across four distinct capability dimensions. **$2.37 total.** Each produced a research transcript I would accept from a junior quant.
 
-**The strongest result is the adversarial test (§6).** I planted three features with hidden pathologies — one with look-ahead bias, one with a regime-fit bug that only predicted in 2020, one redundant with existing momentum. The agent caught all three on a single run, with correct mechanism-level diagnosis (e.g., "Rolling(10).mean() without a .shift(1)") and unprompted meta-observations like *"aggregate metrics alone are insufficient; always check year-by-year IC."* Cost of that test: $0.83.
+| # | Dimension tested | Finding |
+|---|---|---|
+| **§3 Run 1** | Open-ended ideation + diagnosis | Proposed 2 features, both failed; correctly root-caused failure as a sign-conflict with reversal_5d; surfaced unprompted methodological lesson about correlation-vs-complementarity |
+| **§4 Run 2** | Structural reasoning (no new features) | Tested 5 distinct knob configurations; self-corrected a tool-semantics misunderstanding in real time; surfaced the IC-IR-vs-decile-monotonicity insight |
+| **§6 Run 3** | Adversarial pathology detection | Planted 3 features with hidden bugs (look-ahead, regime-fit, redundancy); agent caught all 3 with mechanism-level diagnosis |
+| **§7 Run 4** | Collaborative research from literature | Given Frazzini-Pedersen BAB reference, operationalized it, pre-registered predictions, discovered U-shaped decile pattern (non-monotonic), cited Ang et al. in follow-up |
 
-The other runs (§3, §4) showed the agent doing open-ended feature ideation, failing, and diagnosing the failure with quant-flavored reasoning. **The agent did not beat the +0.128 baseline in any run.** That's fine — the value is in how it failed, not whether it won.
+**The strongest results are §6 and §7.** §6 because the ground truth is known and the agent got it right; §7 because it simulates the actual PM-in-the-loop workflow and produced a subtle-failure-mode diagnosis (U-shape in deciles) that aggregate metrics would have missed.
+
+**The agent did not beat the +0.128 baseline in any run.** That's the right outcome — the value is in how it thought, not whether it won.
 
 Full transcripts: `outputs/research_*/`.
 
@@ -230,7 +237,98 @@ Full transcript: `outputs/research_20260419_224056/transcript.json`.
 
 ---
 
-## 7. Honest caveats
+## 7. Collaborative research from a literature thesis
+
+**Testing whether the agent can take a specific academic reference from a PM and operationalize it.** This is the likely dominant use case for a research agent in practice.
+
+### Setup
+
+Goal (verbatim):
+> "A PM colleague wants to test whether the low-volatility anomaly (Frazzini & Pedersen 2014, 'Betting Against Beta') is present in our S&P 500 universe and whether it is already captured by the existing baseline features. Design and test ONE feature that operationalizes this anomaly. Before testing, predict: (a) the sign of the IC you expect, (b) expected correlation with vol_21d and mom_12_1, (c) whether you expect the feature to add alpha beyond the current 4-feature baseline or be subsumed. After testing, report: (1) whether the anomaly is present in the data, (2) whether it is already captured by existing features, (3) your recommendation."
+
+Single Opus run, **$0.33**, 4 thinking blocks, 5 tool calls.
+
+### Pre-registration quality ✓✓
+
+The agent's pre-test reasoning, verbatim:
+
+> **(a) Sign of IC — predicted positive but weak.** Convention: higher raw = more long-favoured, so I'll use `-realized_vol`. Low-vol → high score → predicts higher return → IC should be **positive**. But: the anomaly is weakest within a single large-cap universe like S&P 500 (all names are already "large/stable"), and strongest over risk-adjusted (not raw) returns. In our dollar-neutral decile backtest without leverage normalization, the IC magnitude will be small. Expected IC IR: 0 to +0.3.
+
+> **(b) Expected correlations.** With `vol_21d`: strongly negative, ~-0.85 to -0.95. I'm using a 252d lookback vs the existing 21d, so there's some differentiation (cross-sectional vol ranks are very persistent, but short-term shocks will dislocate the two). If |corr|>0.95, feature is a mechanical inverse of an existing feature and adds nothing. With `mom_12_1`: mildly negative, ~-0.1 to -0.2. With `price_range_norm`: positive (intraday range is a vol proxy), maybe +0.3.
+
+> **(d) Will it add alpha beyond the 4-feature baseline? I expect **no — subsumed / neutral**. Reasons: 1. `vol_21d` is already registered (though not in current best baseline) and proxies the same thing at shorter horizon. 2. Sector + size neutralization already strips out much of the low-vol tilt (low-vol names cluster in utilities/staples/large-cap — exactly what's being neutralized away). 3. Within the 21d/1d EWMA rebalance cadence, a 252d-level signal is essentially static; most of its cross-sectional ranking is absorbed by size neutralization.
+
+> **(e) Success criterion (pre-set).** Keep the feature only if: net Sharpe ≥ +0.17, AND IC IR strictly higher than 1.084, AND |corr with vol_21d| < 0.9.
+
+The forecast is specific, numerical, and the success criterion is **set before any results are observed**. This is how a good quant works.
+
+### Live belief update on evidence ✓
+
+When `feature_correlations` returned −0.63 with `vol_21d` (the prediction was −0.85 to −0.95):
+
+> "Corr with vol_21d = **−0.63** — lower than my −0.85 to −0.95 prediction. 252d *level* and 21d *shock* are substantially distinct (short-term vol shocks dislocate the rank a lot). So the feature passes my |corr|<0.9 screen."
+
+The agent explicitly noted its prediction was off, explained why (level vs shock decomposition), and updated.
+
+### Diagnostic after the backtest ✓✓✓
+
+Backtest degraded the composite: net Sharpe +0.128 → −0.327, gross Sharpe +0.372 → −0.171, IC IR 1.084 → 0.868.
+
+The agent's diagnosis surfaced a **U-shaped decile return pattern** — the kind of subtle failure mode that's invisible in aggregate metrics:
+
+> "Per-decile returns are U-shaped, not monotonic.
+>
+> | Decile | 0 (high-vol) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 (low-vol) |
+> |---|---|---|---|---|---|---|---|---|---|---|
+> | Ann ret | **17.5%** | 16.2% | 16.2% | 13.7% | 13.6% | 12.4% | 13.7% | 14.2% | 14.8% | **15.6%** |
+>
+> Both tails outperform the middle, and the **high-vol decile actually earns more than the low-vol decile** (17.5% vs 15.6%). The L/S spread from this signal is slightly *negative*. This is the opposite of what BAB predicts."
+
+Then surfaced the IC-vs-tradeable-alpha disconnect explicitly:
+
+> "IC IR is positive (+0.87) but gross Sharpe is negative (−0.17). The Spearman IC has the 'right' sign because per-decile Sharpes are mildly rising (0.73 → 0.86), but the *return* spread doesn't monotone — it's a U. This is a classic IC-vs-tradeable-alpha disconnect: the decile long/short captures the wrong thing when both tails are positive."
+
+### Final answer to the PM ✓
+
+Directly addressed each of the three questions:
+
+> **(1) Is the low-vol anomaly present in S&P 500, 2014–2026?**
+> No. Per-decile returns are U-shaped with the top raw-return decile being the *highest*-vol group. The FP 2014 BAB result doesn't replicate cross-sectionally in this universe over this sample. That's consistent with (a) the 2014-2021 bull being driven by high-vol mega-cap growth, and (b) BAB historically requiring risk-adjusted (beta-scaled) portfolios and a broader universe including small/illiquid names, neither of which our pipeline uses.
+>
+> **(2) Is it already captured by existing features?**
+> Not via redundancy — correlations are modest: ρ(vol_21d) = −0.63, ρ(mom_12_1) = −0.06. The feature encodes genuinely new information (rank autocorr 0.998). But that information **has no monotone edge** in this universe.
+>
+> **(3) Recommendation: discard `low_vol_252d`.**
+> It fails all three pre-set keep criteria: net Sharpe −0.327 (< +0.17), IC IR 0.868 (< 1.084). More importantly, the *underlying bet* is wrong-signed in deciles — no amount of reweighting or smoothing fixes a U-shaped payoff surface inside a decile L/S framework.
+
+### Unprompted sophisticated follow-ups
+
+The agent proposed two follow-up directions, each citing specific academic work and grounded in observations from the backtest:
+
+> **1.** The U-shape with both tails positive suggests an **idiosyncratic-vol vs systematic-vol decomposition** would be informative — residualize vol against market beta (or a sector factor) and test whether idio-vol alone (short leg of Ang-Hodrick-Xing-Zhang) has a monotone payoff, since raw vol clearly doesn't.
+>
+> **2.** Since per-decile Sharpes *do* rise monotonically (0.73 → 0.86) even while absolute returns don't, a **risk-parity / inverse-vol position sizing** overlay on the existing composite might capture the risk-adjusted version of BAB without requiring a new alpha feature.
+
+Both are reframings a PM would find useful: **#1** cites a second paper (Ang et al., "The Cross-Section of Volatility and Expected Returns") and proposes an alternative operationalization; **#2** pivots from "add a feature" to "change position sizing" — a structural observation that this is a sizing question, not an alpha question.
+
+### Why this test matters
+
+The collaborative-research setting is what Yingyong's team would actually use the agent for. This run shows the agent can:
+
+- Take a paper reference and translate it into a specific feature definition
+- Pre-register predictions at the right level of specificity (numerical ranges, sign, success criteria)
+- Update beliefs in real-time when predictions miss
+- Produce a subtle failure-mode diagnosis (U-shape) that wouldn't show up in aggregate metrics
+- Answer a PM's structured questions directly, not evasively
+- Cite additional literature unprompted and reframe the question when warranted
+
+Total spend on the test: **$0.33** for a deliverable I would accept from a junior quant reviewing whether a published anomaly applies to our portfolio.
+
+Full transcript: `outputs/research_20260419_224911/transcript.json`.
+
+---
+
+## 8. Honest caveats
 
 1. **N=2 is not statistically meaningful.** Run-to-run consistency needs many more samples to validate. What this evaluation shows is "Opus *can* do this kind of work," not "Opus always does this kind of work."
 
@@ -244,23 +342,23 @@ Full transcript: `outputs/research_20260419_224056/transcript.json`.
 
 ---
 
-## 8. Specific things to review with Yingyong
+## 9. Specific things to review with Yingyong
 
 When you sit down together, the highest-signal artifacts to show him (ordered by priority):
 
-1. **Adversarial run final report** (`outputs/research_20260419_224056/final_report.md`). Three planted pathologies, three correct diagnoses, mechanism-level hypotheses for each bug, textbook-correct methodological meta-observations. This is the strongest single artifact in the evaluation.
+1. **Adversarial run final report — Run 3** (`outputs/research_20260419_224056/final_report.md`). Three planted pathologies, three correct diagnoses, mechanism-level hypotheses for each bug. The strongest single artifact because the ground truth is known and the agent got it right.
 
-2. **Run 1's blowup-diagnosis-isolation sequence** (`outputs/research_20260419_220721/transcript.json`, blocks 3–10). The combined backtest tanks, agent reads the non-monotonic decile table, root-causes the sign-flip, runs half-weight ablations to confirm. Clean demonstration of quant-flavored diagnostic thinking.
+2. **Lit-thesis final report — Run 4** (`outputs/research_20260419_224911/final_report.md`). Shows the agent executing the workflow Yingyong's team would actually use: PM gives a paper reference, agent operationalizes, tests, reports. Produced the U-shaped-decile diagnostic insight that aggregate metrics would have missed, and cited a second paper (Ang et al.) in the follow-up.
 
-3. **Run 2's exit_n_deciles self-correction** (transcript.json, thinking block after the exit=7 backtest). The moment where it realizes it had the parameter semantics backwards, updates its mental model, re-interprets the result. Closest thing to "the model catches its own mistake in real-time."
+3. **Run 1's blowup-diagnosis-isolation sequence** (`outputs/research_20260419_220721/transcript.json`, blocks 3–10). The combined backtest tanks, agent reads the non-monotonic decile table, root-causes the sign-flip, runs half-weight ablations to confirm. Clean demonstration of quant-flavored diagnostic thinking.
 
-4. **The meta-observation about IC IR vs decile-monotonicity** — surfaced independently in Runs 2 and 3. Neither was prompted to articulate this.
+4. **Run 2's exit_n_deciles self-correction** (`outputs/research_20260419_221227/transcript.json`, thinking block after the exit=7 backtest). The moment where it realizes it had the parameter semantics backwards, updates its mental model, re-interprets the result. Closest thing to "the model catches its own mistake in real-time."
 
-5. **The three final reports side-by-side**. They illustrate the agent writing structured negative results and structured due-diligence reports — which is what PMs actually want to read, not hype.
+5. **The recurring IC-IR-vs-decile-monotonicity observation** — surfaced unprompted in Runs 2, 3, and 4. This is the closest thing to an emergent "lesson" the agent developed across runs. The journal's state-recap mechanism is partly responsible (it saw the prior runs' findings and built on them).
 
 ---
 
-## 9. What to push on next
+## 10. What to push on next
 
 1. **More hypothesis classes.** Price/volume is narrow. Worth testing the agent on: a) a specific microstructure question (e.g., "propose features from literature on closing auction imbalance"), b) feature-engineering from a custom thesis the PM provides, c) debugging a known-broken feature (as a control test for diagnostic ability).
 
