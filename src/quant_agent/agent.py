@@ -202,6 +202,7 @@ def run_research(
         transcript.append(record)
 
     return {
+        "goal": goal,
         "transcript": transcript,
         "history": session.history,
         "proposed_features": session.proposed_feature_source,
@@ -218,6 +219,8 @@ def save_research_run(result: dict, out_dir: Path | None = None) -> Path:
         json.dump(result["transcript"], f, indent=2, default=str)
     with open(out_dir / "history.json", "w") as f:
         json.dump(result["history"], f, indent=2, default=float)
+    if result.get("goal"):
+        (out_dir / "goal.txt").write_text(result["goal"])
     if result["proposed_features"]:
         for name, src in result["proposed_features"].items():
             (out_dir / f"feature_{name}.py").write_text(src)

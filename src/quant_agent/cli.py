@@ -288,6 +288,46 @@ def compare(configs_dir: str, limit: int | None) -> None:
     click.echo(f"\nsaved: {out_dir}")
 
 
+@cli.command("review")
+@click.option(
+    "--runs",
+    default=None,
+    help="Comma-separated run directories (paths). If omitted, auto-discover all research_* under outputs/.",
+)
+@click.option("--model", default="claude-opus-4-7", help="Reviewer model.")
+def review(runs: str | None, model: str) -> None:
+    """Produce a senior-PM-style critique of prior research sessions.
+
+    A single long-context Anthropic call. The reviewer reads each run's goal,
+    final report, and thinking excerpts; grades across six capability axes;
+    and synthesizes what a future user should trust vs double-check.
+    """
+    import os
+    from pathlib import Path
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise click.ClickException("ANTHROPIC_API_KEY not set in environment.")
+
+    from .review import run_review, save_review
+
+    run_dirs = None
+    if runs:
+        run_dirs = [Path(p.strip()) for p in runs.split(",") if p.strip()]
+        for p in run_dirs:
+            if not p.exists():
+                raise click.ClickException(f"run directory not found: {p}")
+
+    click.echo(f"running review (model={model})...")
+    result = run_review(run_dirs=run_dirs, model=model)
+    out = save_review(result)
+    click.echo(f"saved: {out}")
+    u = result["usage"]
+    click.echo(
+        f"usage: input={u['input_tokens']}, output={u['output_tokens']}, "
+        f"cache_read={u['cache_read_input_tokens']}"
+    )
+
+
 @cli.command("research")
 @click.option("--goal", required=True, help="What you want the agent to investigate.")
 @click.option("--max-iter", default=20, type=int, help="Max tool-use iterations.")

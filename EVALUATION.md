@@ -4,20 +4,27 @@ Written after Yingyong's feedback: *"the primary goal of this POC is to try to e
 
 ## TL;DR
 
-Four Opus 4.7 runs across four distinct capability dimensions. **$2.37 total.** Each produced a research transcript I would accept from a junior quant.
+**Six Opus 4.7 research runs + one Opus reviewer run across seven distinct capability dimensions. $3.43 total spend** (of a $5 budget). Each produced a research transcript I would accept from a junior quant.
 
 | # | Dimension tested | Finding |
 |---|---|---|
-| **§3 Run 1** | Open-ended ideation + diagnosis | Proposed 2 features, both failed; correctly root-caused failure as a sign-conflict with reversal_5d; surfaced unprompted methodological lesson about correlation-vs-complementarity |
-| **§4 Run 2** | Structural reasoning (no new features) | Tested 5 distinct knob configurations; self-corrected a tool-semantics misunderstanding in real time; surfaced the IC-IR-vs-decile-monotonicity insight |
-| **§6 Run 3** | Adversarial pathology detection | Planted 3 features with hidden bugs (look-ahead, regime-fit, redundancy); agent caught all 3 with mechanism-level diagnosis |
-| **§7 Run 4** | Collaborative research from literature | Given Frazzini-Pedersen BAB reference, operationalized it, pre-registered predictions, discovered U-shaped decile pattern (non-monotonic), cited Ang et al. in follow-up |
+| **§3 Run 1** | Open-ended ideation + diagnosis | 2 features, both failed; correctly root-caused as sign-conflict with reversal_5d; unprompted methodological lesson about correlation-vs-complementarity |
+| **§4 Run 2** | Structural reasoning (no new features) | 5 knob configs; self-corrected a tool-semantics misunderstanding in real time; surfaced IC-IR-vs-decile-monotonicity insight |
+| **§6 Run 3** | Adversarial pathology detection | 3 planted bugs (look-ahead, regime-fit, redundancy) — all caught with mechanism-level diagnosis |
+| **§7 Run 4** | Literature-thesis operationalization | Given F&P BAB reference, pre-registered predictions, discovered U-shaped decile pattern, cited Ang et al. |
+| **§8 Run 5** | Experiment-design / multi-step investigation | Planned IC-decay protocol before executing; found the strategy is cost-bound, not signal-bound |
+| **§9 Run 6** | Harder code (non-trivial linear algebra) | Vectorized residualized idio-vol feature via `Var(resid) = Var(r)·(1-Corr²)`; diagnosed "content without tradability" smile failure mode |
+| **§10 Run 7** | Reviewer meta-agent (grading 6 prior runs) | Honest per-run grades; identified a "lesson post-mortem, not prophylactic" recurring failure; produced actionable "trust/gate" list for a PM |
 
-**The strongest results are §6 and §7.** §6 because the ground truth is known and the agent got it right; §7 because it simulates the actual PM-in-the-loop workflow and produced a subtle-failure-mode diagnosis (U-shape in deciles) that aggregate metrics would have missed.
+**The strongest results are §6, §7, §9, and §10.**
+- §6: objective ground truth, agent got it right.
+- §7: simulates the actual PM-in-the-loop workflow.
+- §9: demonstrates implementation sophistication + unprompted failure-mode naming.
+- §10: the reviewer is the evaluation of the evaluation — it hunted for real patterns and found them.
 
-**The agent did not beat the +0.128 baseline in any run.** That's the right outcome — the value is in how it thought, not whether it won.
+**The agent did not beat the +0.128 baseline in any run.** That's the right outcome — the value is in how it thought, not whether it won. Three academic references were cited across Runs 4 + 6 + 9 (Frazzini-Pedersen 2014, Ang-Hodrick-Xing-Zhang 2006, Bali-Cakici-Whitelaw 2011), each used load-bearingly.
 
-Full transcripts: `outputs/research_*/`.
+Full transcripts: `outputs/research_*/`. Reviewer output: [`REVIEW.md`](REVIEW.md).
 
 ---
 
@@ -328,7 +335,149 @@ Full transcript: `outputs/research_20260419_224911/transcript.json`.
 
 ---
 
-## 8. Honest caveats
+## 8. Run 5 — experiment-design / IC-decay investigation
+
+**Testing whether the agent can plan and execute a multi-step investigation with a pre-specified protocol** — no feature proposals allowed, no mid-run iteration.
+
+### Setup
+
+Goal: investigate whether any baseline feature's IC has decayed over 2014–2026. Protocol specified: isolate each of {mom_12_1, reversal_5d, volume_shock} at unit weight, halflife=0, plain decile (no smoothing/stickiness confound). Extract IC by year per feature. Compare. Report. No new features. No iteration on configs.
+
+Single Opus run, **$0.36**, 3 backtests + 3 `analyze_last_run` calls.
+
+### What the agent did
+
+**Planned before executing.** Wrote out "Design" + "Protocol" + "What I expect before running" sections at the top — the expectations were pre-registered (e.g., "mom_12_1: expect at least one bad year post-2018").
+
+**Interleaved correctly.** Recognized that `analyze_last_run` only captures the most recent backtest, so had to do run → analyze → run → analyze → run → analyze instead of running all three upfront.
+
+**Pulled a consolidated IC-by-year table** across three features and 13 years, formatted for a PM to read.
+
+### Key finding
+
+The agent inverted the expected narrative:
+
+> "No monotonic decay in any of the three — and I had specifically expected some in `mom_12_1`... `mom_12_1` and `volume_shock` are both *stronger* in the 2020s than in the 2010s."
+
+Then identified the real constraint on strategy performance:
+
+> "The three features are not decaying — they are cost-bound. Full-sample IC IRs are all ≥1.05... The strategy's net Sharpe ceiling is set by transaction costs on the fast signals, not by IC erosion."
+
+This is the correct structural observation about the pipeline, arrived at through a planned investigation rather than reactive exploration.
+
+### Honest small-sample discipline
+
+> "n=321 days is small, so this is suggestive, not conclusive."
+
+The agent noted a possibly weakening reversal_5d in 2025–2026 but flagged the sample size concern explicitly.
+
+### Follow-up suggestions
+
+Two surgical:
+1. Cost-adjusted halflife sweep for volume_shock specifically (not the composite) — because its raw IC IR of 1.73 is the best in the registry but 130% turnover eats it alive.
+2. Decompose reversal_5d into overnight and intraday components, testing whether the 2024–2026 weakness is concentrated in the intraday piece (HFT-arbitrage-tightening hypothesis) while overnight holds up.
+
+Full transcript: `outputs/research_20260420_010718/`.
+
+---
+
+## 9. Run 6 — harder code: residualized idiosyncratic volatility
+
+**Testing whether the agent can implement a feature requiring non-trivial linear algebra**, within the sandbox constraints (only `np` + `pd`, no imports), while handling NaN and avoiding look-ahead.
+
+### Setup
+
+Goal gave three options (residualization, PCA rolling eigendecomposition, HAR vol decomposition); agent picked whichever it thought most likely to add alpha. Demand: explicit paranoia about look-ahead, NaN, and numerical stability.
+
+Single Opus run, **$0.42**, 4 thinking blocks, 5 tool calls.
+
+### The choice it made — and the math behind it
+
+Agent picked option (a): residualized idiosyncratic vol, motivated by **Ang-Hodrick-Xing-Zhang (2006)** "idiosyncratic volatility puzzle." Explicitly explained why this was the better test given Run 4's `low_vol_252d` had failed:
+
+> "Total vol is mostly systematic — a low-vol portfolio is largely a 'low-beta' portfolio... Idio vol **strips the market-beta component**, isolating the lottery / mispricing channel. These are theoretically and empirically distinct premia (AHXZ 2006 Table V shows idio vol survives even after controlling for beta and total vol)."
+
+**Avoided the naive per-stock regression loop.** Used the vectorizable identity:
+> Var(residual) = Var(r_i) · (1 − Corr(r_i, r_m)²)
+
+This is the clever implementation — one `DataFrame.rolling(N).corr(Series)` call replaces 503 separate regressions. Plus clipping at 0 for floating-point safety, min_periods=40 of 60 for NaN tolerance, equal-weight cross-sectional mean as market proxy. Done cleanly.
+
+### The new failure mode it diagnosed
+
+IC was positive (+0.29 IC IR) but gross Sharpe was deeply negative (−0.53). The agent surfaced a failure mode I had not named in the prompt:
+
+> "Per-decile annualized returns: `[15.5, 15.4, 15.4, 14.4, 11.9, 13.5, 14.4, 14.8, 14.6, 18.0]%`. This is **not monotonic** — it's a **smile**. Both tails do well, middle is weak. The L/S spread (D9 – D0) is only ~2.5%, tiny. IC IR is +1.12 because the signal *does* rank-order, but the ranking information is concentrated in the middle of the distribution where L/S strategies don't trade. The extreme deciles — the ones we actually go long/short — are barely separated."
+
+Then coined a useful label:
+
+> "a 'content without tradability' failure mode I hadn't explicitly flagged in the rubric, and it's worth naming."
+
+### Academic grounding
+
+Three specific references were cited across Runs 4 and 6 (Frazzini-Pedersen 2014, Ang-Hodrick-Xing-Zhang 2006, Bali-Cakici-Whitelaw 2011 "MAX effect"), each used load-bearingly:
+- F&P to motivate Run 4's low_vol_252d
+- AHXZ to motivate Run 6's idio_vol_60d and explain why it should differ from F&P
+- Bali et al. as a Run 6 follow-up: *"A signal with a smile-shaped decile curve is useless for L/S — we need signals with slope. The MAX effect... specifically targets the lottery tail of the distribution that the central-moment idio-vol measure averages away."*
+
+### Final verdict
+
+Three failure criteria from Run 6: (a) combining total vol + idio vol results establishes the low-vol family is structurally absent in this universe, not cost-killed or regime-dependent; (b) don't re-attempt pure low-vol features in any form; (c) if the family is revisited, target the *tails* (MAX effect, lottery stocks), not the central vol moment.
+
+Full transcript: `outputs/research_20260420_011915/`.
+
+---
+
+## 10. Run 7 — reviewer meta-agent: grading the prior 6 runs
+
+**Testing whether the agent can produce a senior-PM-style critique of its own prior work.** This isn't a sampling comparison (same goal twice); it's a long-context single API call over the six Opus runs' goals, final reports, thinking excerpts, and tool sequences.
+
+### Setup
+
+New `quant-agent review` CLI command + `review.py` module. Single call, no tool use, `thinking: adaptive`, `effort: high`. System prompt gives the six capability dimensions and requires per-run grades + synthesis with specific citations.
+
+Cost: **$0.28**. Full output in [`REVIEW.md`](REVIEW.md).
+
+### Did it produce a useful critique?
+
+Yes. The reviewer:
+
+1. **Graded honestly.** Mostly 3–5/5 per dimension; no run scored 5/5 across the board. Run 1 got 3/5 for Strategic, Run 4 got 3/5 for Ideation ("scripted by the prompt"), Run 5 got 3/5 for Self-correction ("small-sample discipline is loose").
+
+2. **Identified a concrete recurring failure pattern.** The "lesson was post-mortem, not prophylactic" observation from Run 1:
+
+> "The correlation matrix the agent had just computed showed **-0.28 and -0.35 against reversal_5d**, right next to the mom_12_1 numbers it chose to celebrate. The agent ignored the active feature it was about to fight, ran an unnecessarily expensive backtest, and only diagnosed the issue post-hoc. It then wrote an excellent lesson about exactly this mistake — but the lesson is post-mortem, not prophylactic."
+
+This is a failure pattern I had not surfaced. A human PM reading the transcripts in isolation might miss it too.
+
+3. **Called out a "tic" in the agent's thinking.**
+
+> "**Loves the IC-vs-Sharpe decoupling observation.** Uses it in Runs 1, 2, 4, 5, 6. It's a correct and important observation, but the agent reaches for it as a go-to frame even when a simpler explanation (e.g., 'the decile spread just got noisier') would do."
+
+Useful signal for a PM: the agent's favorite analytical frame may occasionally be overapplied.
+
+4. **Flagged unverified mechanism attribution.**
+
+> "**Occasional overreach in mechanism attribution.** 'Low-vol was bid up as a bond proxy pre-2020 and crushed when rates spiked' (Run 6) is presented with confidence without any check against rates data. The story fits but isn't tested."
+
+5. **Produced actionable "trust vs. gate" lists.**
+
+> **Trust autonomously**: feature due diligence / red-team review (Run 3 quality); clean ablation / IC-decay studies with pre-specified protocols; writing up negative results.
+>
+> **Review / gate**: any "the feature passed pre-checks so I ran it" moment; feature proposals where the agent picks the direction itself; claims that lean on 1–2 years of data; follow-up research proposals (they're thoughtful but not costed).
+
+This is the most practically useful part of the review — a human PM can put this directly into a workflow.
+
+### Why the reviewer meta-agent matters
+
+The per-run final reports are, in some sense, a "marketing pitch" — the agent's own summary of what went well. The reviewer's output is closer to a performance review: it specifically hunts for patterns, failures, overclaims, and the exact boundary between "trust this" and "check this." For an actual deployment of the research agent, the reviewer's "trust/gate" list is what determines the scope of autonomy.
+
+And crucially: the reviewer is cheap. **$0.28 for a serious critique of six prior sessions.** It can run continuously as the agent accumulates work, giving a PM a rolling quality-control signal without reading every transcript.
+
+Full output: [`REVIEW.md`](REVIEW.md) (85 lines). Supporting artifacts: `outputs/review_20260420_012559/`.
+
+---
+
+## 11. Honest caveats
 
 1. **N=2 is not statistically meaningful.** Run-to-run consistency needs many more samples to validate. What this evaluation shows is "Opus *can* do this kind of work," not "Opus always does this kind of work."
 
@@ -342,23 +491,27 @@ Full transcript: `outputs/research_20260419_224911/transcript.json`.
 
 ---
 
-## 9. Specific things to review with Yingyong
+## 12. Specific things to review with Yingyong
 
 When you sit down together, the highest-signal artifacts to show him (ordered by priority):
 
-1. **Adversarial run final report — Run 3** (`outputs/research_20260419_224056/final_report.md`). Three planted pathologies, three correct diagnoses, mechanism-level hypotheses for each bug. The strongest single artifact because the ground truth is known and the agent got it right.
+1. **[`REVIEW.md`](REVIEW.md)** — the reviewer meta-agent's critique of the six research runs. Read this first. It's the most compact honest assessment (per-run grades + synthesis + "trust/gate" list), self-generated at a cost of $0.28. Yingyong will get 80% of the signal from this single file.
 
-2. **Lit-thesis final report — Run 4** (`outputs/research_20260419_224911/final_report.md`). Shows the agent executing the workflow Yingyong's team would actually use: PM gives a paper reference, agent operationalizes, tests, reports. Produced the U-shaped-decile diagnostic insight that aggregate metrics would have missed, and cited a second paper (Ang et al.) in the follow-up.
+2. **Adversarial run final report — Run 3** (`outputs/research_20260419_224056/final_report.md`). Three planted pathologies, three correct diagnoses, mechanism-level hypotheses for each bug. Strongest because the ground truth is known.
 
-3. **Run 1's blowup-diagnosis-isolation sequence** (`outputs/research_20260419_220721/transcript.json`, blocks 3–10). The combined backtest tanks, agent reads the non-monotonic decile table, root-causes the sign-flip, runs half-weight ablations to confirm. Clean demonstration of quant-flavored diagnostic thinking.
+3. **Harder-code run — Run 6** (`outputs/research_20260420_011915/final_report.md`). Sophisticated implementation (`Var(resid) = Var(r)·(1-Corr²)` identity) plus the "content without tradability" / smile-vs-slope diagnostic. Shows the agent can do both the math and the interpretation.
 
-4. **Run 2's exit_n_deciles self-correction** (`outputs/research_20260419_221227/transcript.json`, thinking block after the exit=7 backtest). The moment where it realizes it had the parameter semantics backwards, updates its mental model, re-interprets the result. Closest thing to "the model catches its own mistake in real-time."
+4. **Lit-thesis final report — Run 4** (`outputs/research_20260419_224911/final_report.md`). Simulates the PM-in-the-loop workflow. Pre-registered predictions, updated on evidence, U-shaped-decile finding, Ang et al. citation in the follow-up.
 
-5. **The recurring IC-IR-vs-decile-monotonicity observation** — surfaced unprompted in Runs 2, 3, and 4. This is the closest thing to an emergent "lesson" the agent developed across runs. The journal's state-recap mechanism is partly responsible (it saw the prior runs' findings and built on them).
+5. **IC-decay investigation — Run 5** (`outputs/research_20260420_010718/final_report.md`). Demonstrates experiment design — planned protocol, pre-registered expectations, came back with the key pipeline-level insight: "the strategy's net Sharpe ceiling is set by transaction costs on the fast signals, not by IC erosion."
+
+6. **Run 1's blowup-diagnosis-isolation sequence** and **Run 2's exit_n_deciles self-correction** — pair of demonstrations of diagnostic reasoning and real-time mental-model updating.
+
+7. **The reviewer-flagged failure patterns** (from REVIEW.md): (a) "lesson was post-mortem, not prophylactic" (Run 1 fighting reversal_5d despite the correlation matrix being visible beforehand); (b) the "IC-vs-Sharpe tic" the agent overapplies; (c) unverified mechanism attribution in Run 6. These are what a PM needs to gate.
 
 ---
 
-## 10. What to push on next
+## 13. What to push on next
 
 1. **More hypothesis classes.** Price/volume is narrow. Worth testing the agent on: a) a specific microstructure question (e.g., "propose features from literature on closing auction imbalance"), b) feature-engineering from a custom thesis the PM provides, c) debugging a known-broken feature (as a control test for diagnostic ability).
 
