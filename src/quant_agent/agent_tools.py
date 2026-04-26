@@ -72,6 +72,11 @@ class ResearchSession:
     # `analyze_last_run` and friends don't need to recompute.
     recent_runs: list["RunArtifacts"] = field(default_factory=list)
     recent_runs_max: int = 5
+    # Inter-agent handoff: portfolio agent's construct_* tools populate this;
+    # cost_risk agent's evaluate_candidate_portfolio reads it. None means
+    # cost_risk falls back to the alpha agent's most recent backtest weights.
+    candidate_weights: pd.DataFrame | None = None
+    candidate_weights_method: str | None = None
 
     @classmethod
     def from_cache(

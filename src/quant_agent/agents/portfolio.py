@@ -55,7 +55,11 @@ def _tool_factory(session=None, **_ctx) -> list:
     @beta_tool
     def construct_signal_weighted(target_gross: float = 2.0, max_single_name: float = 0.05,
                                   max_sector_weight: float = 0.30) -> str:
-        """Construct signal-weighted-constrained weights from the most recent signal."""
+        """Construct signal-weighted-constrained weights from the most recent signal.
+
+        Persists the result to session.candidate_weights so cost_risk agent
+        can evaluate THIS portfolio (not alpha's backtest weights).
+        """
         last = session.last_run() if hasattr(session, "last_run") else None
         if last is None:
             return json.dumps({"error": "no signal available; alpha agent must run first"})
@@ -68,17 +72,24 @@ def _tool_factory(session=None, **_ctx) -> list:
             max_single_name=max_single_name,
             max_sector_weight=max_sector_weight,
         )
+        session.candidate_weights = weights
+        session.candidate_weights_method = "signal_weighted_constrained"
         return json.dumps({
             "method": "signal_weighted_constrained",
             "shape": list(weights.shape),
             "avg_gross": float(weights.abs().sum(axis=1).mean()),
             "avg_n_long": float((weights > 0).sum(axis=1).mean()),
             "avg_n_short": float((weights < 0).sum(axis=1).mean()),
+            "max_abs_weight": float(weights.abs().max().max()),
+            "stored": "session.candidate_weights",
         }, default=str)
 
     @beta_tool
     def construct_mean_variance(target_te: float = 0.10, lookback: int = 252) -> str:
-        """Construct mean-variance weights with target tracking-error."""
+        """Construct mean-variance weights with target tracking-error.
+
+        Persists the result to session.candidate_weights.
+        """
         last = session.last_run() if hasattr(session, "last_run") else None
         if last is None:
             return json.dumps({"error": "no signal available; alpha agent must run first"})
@@ -87,24 +98,37 @@ def _tool_factory(session=None, **_ctx) -> list:
         from ..optimization import mean_variance_weights
 
         w = mean_variance_weights(last.signal, rets, target_te=target_te, lookback=lookback)
+        session.candidate_weights = w
+        session.candidate_weights_method = "mean_variance"
         return json.dumps({
             "method": "mean_variance",
             "shape": list(w.shape),
             "avg_gross": float(w.abs().sum(axis=1).mean()),
+            "avg_n_long": float((w > 0).sum(axis=1).mean()),
+            "avg_n_short": float((w < 0).sum(axis=1).mean()),
+            "max_abs_weight": float(w.abs().max().max()),
+            "stored": "session.candidate_weights",
         }, default=str)
 
     @beta_tool
     def construct_risk_parity(lookback: int = 252) -> str:
-        """Construct risk-parity weights (no signal needed)."""
+        """Construct risk-parity weights (no signal needed).
+
+        Persists the result to session.candidate_weights.
+        """
         prices = session.panel["adj_close"]
         rets = prices.pct_change()
         from ..optimization import risk_parity_weights
 
         w = risk_parity_weights(rets, lookback=lookback)
+        session.candidate_weights = w
+        session.candidate_weights_method = "risk_parity"
         return json.dumps({
             "method": "risk_parity",
             "shape": list(w.shape),
             "avg_gross": float(w.abs().sum(axis=1).mean()),
+            "avg_n_long": float((w > 0).sum(axis=1).mean()),
+            "stored": "session.candidate_weights",
         }, default=str)
 
     return [construct_signal_weighted, construct_mean_variance, construct_risk_parity]

@@ -91,15 +91,19 @@ def _tool_factory(session=None, ips: IPS | None = None, **_ctx) -> list:
         except json.JSONDecodeError as e:
             return json.dumps({"error": f"invalid candidate_summary JSON: {e}"})
         flags = []
-        if d.get("sharpe", 0) > ips.governance.flag_inflated_sharpe_threshold:
-            flags.append(f"sharpe={d['sharpe']:.3f} exceeds inflation threshold "
+        # Null-safe coercion: risk-parity portfolios have no IC, so ic_ir/sharpe may be None.
+        sharpe = d.get("sharpe") or 0.0
+        ic_ir = d.get("ic_ir") or 0.0
+        gross_sharpe = d.get("gross_sharpe") or 0.0
+        if sharpe > ips.governance.flag_inflated_sharpe_threshold:
+            flags.append(f"sharpe={sharpe:.3f} exceeds inflation threshold "
                         f"{ips.governance.flag_inflated_sharpe_threshold} — possible look-ahead")
-        if d.get("ic_ir", 0) > ips.governance.flag_inflated_ic_ir_threshold:
-            flags.append(f"ic_ir={d['ic_ir']:.3f} exceeds inflation threshold "
+        if ic_ir > ips.governance.flag_inflated_ic_ir_threshold:
+            flags.append(f"ic_ir={ic_ir:.3f} exceeds inflation threshold "
                         f"{ips.governance.flag_inflated_ic_ir_threshold} — possible look-ahead")
         if d.get("hard_violations"):
             flags.append(f"{len(d['hard_violations'])} hard IPS violations present — VETO")
-        if d.get("gross_sharpe", 0) > 0 and d.get("sharpe", 0) < 0:
+        if gross_sharpe > 0 and sharpe < 0:
             flags.append("gross Sharpe positive but net Sharpe negative — cost-bound, not signal-bound")
         return json.dumps({"governance_flags": flags, "n_flags": len(flags)}, default=str)
 

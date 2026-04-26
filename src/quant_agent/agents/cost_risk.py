@@ -58,28 +58,51 @@ def _tool_factory(session=None, ips: IPS | None = None, **_ctx) -> list:
 
     @beta_tool
     def evaluate_candidate_portfolio() -> str:
-        """Compute realistic cost-adjusted returns + IPS metrics + violations."""
-        last = session.last_run() if hasattr(session, "last_run") else None
-        if last is None:
-            return json.dumps({"error": "no candidate portfolio to evaluate"})
+        """Compute realistic cost-adjusted returns + IPS metrics + violations.
 
+        Prefers session.candidate_weights (set by the portfolio agent's
+        construct_* tools). Falls back to the alpha agent's last backtest
+        weights only if no candidate is set.
+        """
         from ..cost_models import cost_model_from_ips
         from ..risk import risk_report
 
-        weights = last.weights
+        weights = None
+        source = None
+        if getattr(session, "candidate_weights", None) is not None:
+            weights = session.candidate_weights
+            source = f"candidate_weights ({getattr(session, 'candidate_weights_method', 'unknown')})"
+        else:
+            last = session.last_run() if hasattr(session, "last_run") else None
+            if last is None:
+                return json.dumps({
+                    "error": "no candidate weights and no prior backtest available — portfolio agent must run first",
+                })
+            weights = last.weights
+            source = "fallback_to_alpha_backtest_weights"
+
         cm = cost_model_from_ips(ips.cost_model)
         prior = weights.shift(1).fillna(0.0)
+        dollar_vol = session.feature_cache.get("dollar_vol_20d")
         per_day_cost = cm.cost_per_day(
             weights=weights,
             prior_weights=prior,
-            dollar_vol=session.feature_cache.get("dollar_vol_20d"),
+            dollar_vol=dollar_vol,
         )
-        gross_returns = last.gross_returns
+
+        # Recompute gross returns from THESE weights, not whatever ran before.
+        prices = session.panel["adj_close"]
+        fwd_ret = prices.pct_change().shift(-1).reindex_like(weights)
+        gross_returns = (weights * fwd_ret).sum(axis=1)
         net_after_realistic = gross_returns - per_day_cost.reindex_like(gross_returns).fillna(0)
 
         report = risk_report(weights, net_after_realistic, session.sectors, ips)
+        gross_std = max(float(gross_returns.std(ddof=0)), 1e-9)
+        net_std = max(float(net_after_realistic.std(ddof=0)), 1e-9)
+        report["weights_source"] = source
+        report["gross_sharpe"] = float(gross_returns.mean() / gross_std * (252 ** 0.5))
         report["realistic_net_sharpe"] = float(
-            net_after_realistic.mean() / max(net_after_realistic.std(ddof=0), 1e-9) * (252 ** 0.5)
+            net_after_realistic.mean() / net_std * (252 ** 0.5)
         )
         report["realistic_avg_cost_drag_ann"] = float(per_day_cost.mean() * 252)
         verdict = "APPROVED" if report["passes_ips"] else "REJECTED"
