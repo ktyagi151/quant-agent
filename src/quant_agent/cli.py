@@ -294,21 +294,52 @@ def compare(configs_dir: str, limit: int | None) -> None:
 @click.option("--dry-run/--live", default=True,
               help="Dry-run renders prompts without API calls (default). --live invokes Anthropic.")
 @click.option("--meta/--no-meta", default=False, help="Also run the meta-agent pass.")
-def orchestrate(ips_path: str, limit: int | None, dry_run: bool, meta: bool) -> None:
+@click.option(
+    "--cheap",
+    is_flag=True,
+    default=False,
+    help="Force all agents to claude-haiku-4-5 with tight max_iter (for budget-bound smoke tests).",
+)
+@click.option(
+    "--max-iter",
+    type=int,
+    default=None,
+    help="Override max_iterations on every agent (e.g. 3 for a tight smoke test).",
+)
+def orchestrate(ips_path: str, limit: int | None, dry_run: bool, meta: bool,
+                cheap: bool, max_iter: int | None) -> None:
     """Run one investment cycle through the multi-agent pipeline.
 
     Default is --dry-run: every agent's system prompt is rendered against
     the IPS, but no Anthropic call is made. Useful for inspecting wiring
     and prompt content without spending budget. Use --live to actually
     invoke the agents.
+
+    --cheap: forces every agent to claude-haiku-4-5 (~5× cheaper than Opus)
+    and tight max_tokens. Useful for under-$0.20 smoke tests against a real
+    API key.
     """
     from .orchestrator import orchestrate as _orch
+    from . import agents as ag
+
+    # Apply runtime overrides to specs.
+    if cheap or max_iter is not None:
+        for spec in [ag.alpha_agent_spec, ag.portfolio_agent_spec,
+                     ag.cost_risk_agent_spec, ag.critic_agent_spec, ag.meta_agent_spec]:
+            if cheap:
+                spec.model = "claude-haiku-4-5"
+                spec.use_thinking = False    # Haiku doesn't support adaptive thinking
+                spec.max_tokens = min(spec.max_tokens, 4000)
+            if max_iter is not None:
+                spec.max_iterations = max_iter
 
     cycle = _orch(ips_path=ips_path, limit=limit, dry_run=dry_run, run_meta=meta)
     click.echo(f"\ncycle: {cycle.cycle_id}")
     click.echo(f"verdict: {cycle.final_verdict}")
     if cycle.notes:
         click.echo(f"notes: {cycle.notes}")
+
+    total_cost = 0.0
     for name, r in cycle.agent_results.items():
         if dry_run:
             preview = r.outputs.get("system_prompt_preview", "")
@@ -317,7 +348,25 @@ def orchestrate(ips_path: str, limit: int | None, dry_run: bool, meta: bool) -> 
             if preview:
                 click.echo(f"    preview: {preview[:120]}...")
         else:
-            click.echo(f"\n  [{name}] success={r.success} usage={r.usage}")
+            u = r.usage
+            in_t = u.get("input_tokens", 0)
+            out_t = u.get("output_tokens", 0)
+            cache_r = u.get("cache_read_input_tokens", 0)
+            # Cost depends on model — check by spec lookup.
+            spec = next((s for s in [ag.alpha_agent_spec, ag.portfolio_agent_spec,
+                                     ag.cost_risk_agent_spec, ag.critic_agent_spec, ag.meta_agent_spec]
+                         if s.name == name), None)
+            if spec and "haiku" in spec.model.lower():
+                cost = in_t/1e6*1.0 + out_t/1e6*5.0 + cache_r/1e6*0.1
+            else:
+                cost = in_t/1e6*5.0 + out_t/1e6*25.0 + cache_r/1e6*0.5
+            total_cost += cost
+            click.echo(f"\n  [{name}] success={r.success} input={in_t} output={out_t} cache_read={cache_r} cost=${cost:.4f}")
+            if r.error:
+                click.echo(f"    error: {r.error}")
+
+    if not dry_run:
+        click.echo(f"\nTotal estimated cost: ${total_cost:.4f}")
 
 
 @cli.command("review")
