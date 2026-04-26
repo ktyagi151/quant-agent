@@ -1,0 +1,113 @@
+# Default Investment Policy Statement
+#
+# This is the contract the multi-agent system operates under. Every agent
+# (data, alpha, portfolio, cost/risk, critic, meta) loads it and respects
+# its constraints. Hard constraints are auto-veto triggers; soft constraints
+# are guidance.
+#
+# Critically: the holdout window is frozen — the meta-agent only promotes
+# prompt rewrites that improve out-of-sample metrics on this slice.
+
+name: default
+description: "POC IPS for the quant-agent multi-agent system."
+
+universe:
+  source: wikipedia
+  symbol_set: sp500
+  point_in_time: true
+  min_dollar_vol_usd: 5000000
+
+data:
+  start: "2014-01-01"
+  end: "today"
+  fields: [open, high, low, close, adj_close, volume]
+
+holdout:
+  in_sample_start: "2014-01-01"
+  in_sample_end: "2021-12-31"
+  holdout_start: "2022-01-01"
+  holdout_end: "2026-04-17"
+  min_observations: 252           # require ≥1 trading year before promoting
+  bonferroni_n_tests: 20
+
+cost_model:
+  type: sqrt_impact               # flat | sqrt_impact | composite
+  half_spread_bps: 1.0
+  impact_coefficient: 10.0        # bps per sqrt(trade/ADV)
+
+# Hard constraints — any candidate portfolio violating these is rejected.
+hard_constraints:
+  - name: gross_exposure_cap
+    metric: gross_exposure
+    op: "<="
+    threshold: 2.5
+    description: "Max 250% gross (long + |short|). Standard L/S limit."
+
+  - name: net_exposure_band
+    metric: net_exposure
+    op: "<="
+    threshold: 0.10
+    description: "Net |long - short| <= 10% (we want dollar-neutral by design)."
+
+  - name: turnover_cap
+    metric: avg_turnover
+    op: "<="
+    threshold: 0.50
+    description: "Avg daily turnover <= 50%. Anything higher will lose to costs."
+
+  - name: max_dd_cap
+    metric: max_drawdown
+    op: ">="
+    threshold: -0.50
+    description: "Max drawdown >= -50%. Below this is unrecoverable in practice."
+
+  - name: max_sector_weight
+    metric: max_sector_weight
+    op: "<="
+    threshold: 0.30
+    description: "No more than 30% of capital in a single GICS sector."
+
+  - name: max_single_name
+    metric: max_single_name_weight
+    op: "<="
+    threshold: 0.05
+    description: "No more than 5% in a single name (long or short side)."
+
+  - name: min_breadth_long
+    metric: min_n_long
+    op: ">="
+    threshold: 20
+    description: "At least 20 long names. Breadth check."
+
+  - name: min_breadth_short
+    metric: min_n_short
+    op: ">="
+    threshold: 20
+    description: "At least 20 short names. Breadth check."
+
+# Soft constraints — guidance for the alpha + portfolio agents.
+soft_constraints:
+  - name: target_turnover
+    metric: avg_turnover
+    target: 0.20
+    weight: 1.0
+    description: "Aim for 20% daily turnover; hard cap is 50%."
+
+  - name: target_ic_ir
+    metric: ic_ir
+    target: 1.5
+    weight: 1.0
+    description: "Aim for IC IR >= 1.5; below 1.0 means signal is weak."
+
+  - name: target_net_sharpe
+    metric: sharpe
+    target: 0.30
+    weight: 1.0
+    description: "Aim for net Sharpe >= 0.30 in-sample to be worth deploying."
+
+# Governance — rules the critic enforces and the meta-agent respects.
+governance:
+  require_oos_evaluation: true
+  multi_testing_correction: true
+  flag_inflated_sharpe_threshold: 0.5
+  flag_inflated_ic_ir_threshold: 2.5

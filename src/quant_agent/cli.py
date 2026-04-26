@@ -288,6 +288,38 @@ def compare(configs_dir: str, limit: int | None) -> None:
     click.echo(f"\nsaved: {out_dir}")
 
 
+@cli.command("orchestrate")
+@click.option("--ips", "ips_path", default="configs/ips/default.yaml", help="IPS YAML file.")
+@click.option("--limit", type=int, default=None, help="Limit universe size (live runs only).")
+@click.option("--dry-run/--live", default=True,
+              help="Dry-run renders prompts without API calls (default). --live invokes Anthropic.")
+@click.option("--meta/--no-meta", default=False, help="Also run the meta-agent pass.")
+def orchestrate(ips_path: str, limit: int | None, dry_run: bool, meta: bool) -> None:
+    """Run one investment cycle through the multi-agent pipeline.
+
+    Default is --dry-run: every agent's system prompt is rendered against
+    the IPS, but no Anthropic call is made. Useful for inspecting wiring
+    and prompt content without spending budget. Use --live to actually
+    invoke the agents.
+    """
+    from .orchestrator import orchestrate as _orch
+
+    cycle = _orch(ips_path=ips_path, limit=limit, dry_run=dry_run, run_meta=meta)
+    click.echo(f"\ncycle: {cycle.cycle_id}")
+    click.echo(f"verdict: {cycle.final_verdict}")
+    if cycle.notes:
+        click.echo(f"notes: {cycle.notes}")
+    for name, r in cycle.agent_results.items():
+        if dry_run:
+            preview = r.outputs.get("system_prompt_preview", "")
+            chars = r.outputs.get("system_prompt_chars", 0)
+            click.echo(f"\n  [{name}] system prompt: {chars} chars")
+            if preview:
+                click.echo(f"    preview: {preview[:120]}...")
+        else:
+            click.echo(f"\n  [{name}] success={r.success} usage={r.usage}")
+
+
 @cli.command("review")
 @click.option(
     "--runs",
