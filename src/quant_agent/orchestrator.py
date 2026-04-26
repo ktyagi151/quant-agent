@@ -244,17 +244,33 @@ def run_cycle(
 
     pipeline = [
         (ag.alpha_agent_spec, "Propose and test ONE feature on the in-sample window. Follow the IPS methodology."),
-        (ag.portfolio_agent_spec, "Construct an IPS-compliant portfolio from the most recent signal."),
+        (ag.portfolio_agent_spec, "Construct an IPS-compliant portfolio from the alpha agent's signal."),
         (ag.cost_risk_agent_spec, "Evaluate the candidate portfolio under the IPS cost model + hard constraints."),
         (ag.critic_agent_spec, "Final verdict: APPROVED, AUDIT_REQUIRED, or VETOED."),
     ]
 
+    # Thread prior agent outputs forward so each agent sees what the previous
+    # agents produced. Capped per-agent to keep input tokens bounded.
+    PER_AGENT_PRIOR_CHARS = 2500
+    prior_outputs: dict[str, str] = {}
+
     for spec, default_msg in pipeline:
+        user_msg = default_msg
+        if prior_outputs:
+            sections = ["", "# Prior agent outputs in this cycle (read-only context)"]
+            for prev_name, prev_text in prior_outputs.items():
+                sections.append(f"\n## {prev_name} agent said:")
+                sections.append(prev_text[:PER_AGENT_PRIOR_CHARS] +
+                                ("\n... [truncated]" if len(prev_text) > PER_AGENT_PRIOR_CHARS else ""))
+            user_msg += "\n".join(sections)
+
         try:
-            r = invoker(spec=spec, ips=ips, user_message=default_msg, session=session)
+            r = invoker(spec=spec, ips=ips, user_message=user_msg, session=session)
         except Exception as e:  # noqa: BLE001
             r = AgentResult(agent_name=spec.name, success=False, outputs={}, error=f"{type(e).__name__}: {e}")
         result.agent_results[spec.name] = r
+        # Capture text for the next agent's context.
+        prior_outputs[spec.name] = r.outputs.get("final_text", "") or ""
         if not r.success:
             result.final_verdict = "ERROR"
             result.notes = f"{spec.name} failed: {r.error}"
