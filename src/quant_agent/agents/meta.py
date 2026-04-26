@@ -105,7 +105,90 @@ def _tool_factory(session=None, ips: IPS | None = None, **_ctx) -> list:
             return json.dumps({"error": "no calibration store"})
         return json.dumps(session.calibration.summary(), indent=2, default=str)
 
-    return [list_journal_runs, calibration_summary]
+    @beta_tool
+    def list_prompt_versions(agent_name: str) -> str:
+        """List all prompt versions for the named agent (alpha, portfolio, cost_risk, critic, meta).
+
+        Returns version numbers, promoted/rolled-back status, and metrics
+        recorded at promotion time. Use this to understand the prompt history
+        of an agent before proposing a rewrite.
+        """
+        from ..prompt_history import PromptHistory
+
+        store = PromptHistory.default()
+        versions = store.list_versions(agent_name)
+        return json.dumps([
+            {
+                "version": v.version,
+                "parent_version": v.parent_version,
+                "rationale": v.rationale,
+                "created_at": v.created_at,
+                "promoted": v.promoted,
+                "rolled_back": v.rolled_back,
+                "metrics_at_promotion": v.metrics_at_promotion,
+            }
+            for v in versions
+        ], indent=2, default=str)
+
+    @beta_tool
+    def propose_prompt_rewrite(agent_name: str, new_text: str, rationale: str) -> str:
+        """Submit a candidate system-prompt rewrite for an agent.
+
+        The proposal is stored in the prompt-history store as a pending
+        version with a parent pointer to the current latest. It is NOT
+        promoted automatically — a separate validation step runs the
+        proposed prompt against the holdout window and applies the
+        Bonferroni-corrected promotion rule before any change takes effect.
+
+        Args:
+            agent_name: One of alpha, portfolio, cost_risk, critic, meta.
+            new_text: The full new system prompt text. Must be a complete
+                replacement, not a diff.
+            rationale: One-paragraph justification — what specific behavior
+                does this rewrite intend to change, and what evidence from
+                the journal/calibration history motivated it?
+
+        Returns the assigned version number + a status string.
+        """
+        from ..prompt_history import PromptHistory
+
+        valid_agents = {"alpha", "portfolio", "cost_risk", "critic", "meta"}
+        if agent_name not in valid_agents:
+            return json.dumps({
+                "error": f"unknown agent_name {agent_name!r}; must be one of {sorted(valid_agents)}",
+            })
+        if not new_text or len(new_text) < 200:
+            return json.dumps({
+                "error": "new_text must be a complete prompt (≥200 chars), not a diff or fragment",
+            })
+        if not rationale or len(rationale) < 30:
+            return json.dumps({
+                "error": "rationale must be a substantive justification (≥30 chars)",
+            })
+
+        store = PromptHistory.default()
+        parent = store.latest(agent_name)
+        pv = store.add_proposal(
+            agent=agent_name,
+            text=new_text,
+            rationale=rationale,
+            parent=parent,
+        )
+        return json.dumps({
+            "status": "PROPOSED_PENDING_VALIDATION",
+            "agent": agent_name,
+            "version": pv.version,
+            "parent_version": pv.parent_version,
+            "text_hash": pv.text_hash,
+            "next_step": "Orchestrator will run validation on holdout. Promotion is gated on Bonferroni-corrected OOS improvement.",
+        }, indent=2, default=str)
+
+    return [
+        list_journal_runs,
+        calibration_summary,
+        list_prompt_versions,
+        propose_prompt_rewrite,
+    ]
 
 
 meta_agent_spec = AgentSpec(

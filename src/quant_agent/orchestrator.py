@@ -33,11 +33,13 @@ from typing import Callable
 
 import pandas as pd
 
+import math
+
 from . import agents as ag
 from .agents.base import AgentResult, AgentSpec
 from .ips import IPS, load_ips, validate_ips
 from .io_utils import outputs_dir
-from .prompt_history import PromptHistory
+from .prompt_history import PromptHistory, PromptVersion
 
 
 # ----- runtime configuration -----------------------------------------------
@@ -300,17 +302,260 @@ def run_cycle(
 
 
 def run_meta_pass(ips: IPS, session=None, dry_run: bool = True) -> AgentResult:
-    """Invoke the meta-agent. Run on a longer cadence (e.g. weekly)."""
+    """Invoke the meta-agent. Run on a longer cadence (e.g. weekly).
+
+    For a complete propose -> validate -> promote loop, use `run_meta_cycle`,
+    which wraps this call with the validation harness.
+    """
     invoker = _invoke_agent_dry_run if dry_run else _invoke_agent_live
     return invoker(
         spec=ag.meta_agent_spec,
         ips=ips,
         user_message=(
             "Review the journal + calibration history. Propose ONE prompt rewrite "
-            "or feature graveyard addition. Do not promote without an OOS test on the holdout."
+            "via propose_prompt_rewrite. The orchestrator will validate against the "
+            "holdout and apply the Bonferroni-corrected promotion rule."
         ),
         session=session,
     )
+
+
+# ----- prompt-rewrite validation + promotion --------------------------------
+
+
+@dataclass
+class PromotionDecision:
+    version: int
+    agent: str
+    decision: str            # "PROMOTED" | "REJECTED_NO_IMPROVEMENT" | "REJECTED_INSUFFICIENT_OBSERVATIONS" | "REJECTED_IPS_VIOLATION"
+    in_sample_metrics: dict
+    holdout_metrics: dict
+    baseline_holdout_metrics: dict
+    sharpe_delta: float
+    bonferroni_threshold: float
+    rationale: str
+
+
+def _spec_with_prompt_override(base_spec: AgentSpec, override_text: str) -> AgentSpec:
+    """Return a shallow copy of `base_spec` with the system prompt replaced by `override_text`."""
+    return AgentSpec(
+        name=base_spec.name,
+        description=base_spec.description,
+        system_prompt_fn=lambda ips, **_: override_text,
+        tool_factory=base_spec.tool_factory,
+        model=base_spec.model,
+        use_thinking=base_spec.use_thinking,
+        effort=base_spec.effort,
+        max_tokens=base_spec.max_tokens,
+        max_iterations=base_spec.max_iterations,
+    )
+
+
+def _alpha_run_metrics(session) -> dict:
+    """Pull headline metrics from the most recent backtest in `session`."""
+    if session is None:
+        return {}
+    last = session.last_run() if hasattr(session, "last_run") else None
+    if last is None:
+        return {}
+    return {
+        k: last.summary.get(k)
+        for k in ["sharpe", "gross_sharpe", "ic_ir", "avg_turnover", "max_drawdown"]
+    }
+
+
+def _bonferroni_threshold(ips: IPS, baseline_sharpe_std: float = 0.3) -> float:
+    """Approx Sharpe-improvement threshold for promotion under Bonferroni correction.
+
+    The IPS specifies n_tests; the rule of thumb is: an improvement must
+    exceed ~ critical_z / sqrt(n_tests) × noise_std to be considered
+    significant after correction. We use z=2.0 (≈ p=0.05 two-sided) as the
+    pre-correction critical value, then divide by sqrt(n_tests).
+    """
+    n = max(1, ips.holdout.bonferroni_n_tests)
+    return 2.0 * baseline_sharpe_std / math.sqrt(n)
+
+
+def validate_prompt_rewrite(
+    version: PromptVersion,
+    ips: IPS,
+    in_sample_session=None,
+    holdout_session=None,
+    invoker: Callable | None = None,
+) -> PromotionDecision:
+    """Run the proposed prompt against in-sample + holdout, decide promotion.
+
+    `invoker` lets tests inject a mock that returns canned metrics without
+    invoking the API. In production it defaults to the live invoker.
+    """
+    if invoker is None:
+        invoker = _invoke_agent_live
+
+    # Build a spec with the candidate prompt swapped in.
+    base_spec = {
+        "alpha": ag.alpha_agent_spec,
+        "portfolio": ag.portfolio_agent_spec,
+        "cost_risk": ag.cost_risk_agent_spec,
+        "critic": ag.critic_agent_spec,
+        "meta": ag.meta_agent_spec,
+    }.get(version.agent)
+    if base_spec is None:
+        return PromotionDecision(
+            version=version.version,
+            agent=version.agent,
+            decision="REJECTED_NO_IMPROVEMENT",
+            in_sample_metrics={},
+            holdout_metrics={},
+            baseline_holdout_metrics={},
+            sharpe_delta=0.0,
+            bonferroni_threshold=0.0,
+            rationale=f"unknown agent: {version.agent}",
+        )
+    candidate_spec = _spec_with_prompt_override(base_spec, version.text)
+
+    user_msg = (
+        "This is a validation run for a candidate prompt rewrite. Execute your role exactly "
+        "as specified in the (newly rewritten) system prompt. Do not propose further rewrites."
+    )
+
+    # Run on in-sample.
+    in_sample_result = invoker(
+        spec=candidate_spec, ips=ips, user_message=user_msg, session=in_sample_session
+    )
+    in_sample_metrics = (
+        _alpha_run_metrics(in_sample_session) if in_sample_session is not None else {}
+    )
+
+    # Run on holdout.
+    holdout_result = invoker(
+        spec=candidate_spec, ips=ips, user_message=user_msg, session=holdout_session
+    )
+    holdout_metrics = (
+        _alpha_run_metrics(holdout_session) if holdout_session is not None else {}
+    )
+
+    # Pull baseline holdout metrics from the journal (whichever run is the
+    # current best on the holdout window — read by ix into journal).
+    baseline_holdout: dict = {}
+    if holdout_session is not None and holdout_session.journal is not None:
+        best = holdout_session.journal.best()
+        if best is not None:
+            baseline_holdout = best.get("summary", {})
+
+    # Promotion rule.
+    candidate_sharpe = holdout_metrics.get("sharpe") or 0.0
+    baseline_sharpe = baseline_holdout.get("sharpe") or 0.0
+    sharpe_delta = candidate_sharpe - baseline_sharpe
+    threshold = _bonferroni_threshold(ips)
+
+    n_obs = len(holdout_session.panel.get("adj_close", [])) if holdout_session is not None else 0
+    if n_obs < ips.holdout.min_observations:
+        decision = "REJECTED_INSUFFICIENT_OBSERVATIONS"
+        rationale = (
+            f"holdout has {n_obs} observations, IPS requires ≥{ips.holdout.min_observations}"
+        )
+    elif sharpe_delta <= threshold:
+        decision = "REJECTED_NO_IMPROVEMENT"
+        rationale = (
+            f"holdout Sharpe Δ={sharpe_delta:+.3f} ≤ Bonferroni threshold {threshold:.3f} "
+            f"(z=2.0 / √{ips.holdout.bonferroni_n_tests} × baseline_std=0.3). "
+            "Not promoted."
+        )
+    elif (
+        in_sample_metrics.get("avg_turnover") is not None
+        and any(
+            hc.metric == "avg_turnover" and hc.op == "<="
+            and in_sample_metrics["avg_turnover"] > hc.threshold
+            for hc in ips.hard_constraints
+        )
+    ):
+        decision = "REJECTED_IPS_VIOLATION"
+        rationale = "candidate violates IPS turnover hard cap on in-sample"
+    else:
+        decision = "PROMOTED"
+        rationale = (
+            f"holdout Sharpe Δ={sharpe_delta:+.3f} > Bonferroni threshold {threshold:.3f}, "
+            "no IPS violations. PROMOTED."
+        )
+
+    decision_obj = PromotionDecision(
+        version=version.version,
+        agent=version.agent,
+        decision=decision,
+        in_sample_metrics=in_sample_metrics,
+        holdout_metrics=holdout_metrics,
+        baseline_holdout_metrics=baseline_holdout,
+        sharpe_delta=sharpe_delta,
+        bonferroni_threshold=threshold,
+        rationale=rationale,
+    )
+
+    # Apply.
+    if decision == "PROMOTED":
+        store = PromptHistory.default()
+        store.promote(version, metrics=holdout_metrics)
+    return decision_obj
+
+
+def run_meta_cycle(
+    ips: IPS,
+    in_sample_session=None,
+    holdout_session=None,
+    dry_run: bool = True,
+    invoker: Callable | None = None,
+) -> dict:
+    """Full meta loop: invoke meta-agent → if it proposed, validate → promote/reject.
+
+    Returns a dict with the meta-agent's AgentResult and any PromotionDecision.
+    """
+    if invoker is None:
+        invoker = _invoke_agent_dry_run if dry_run else _invoke_agent_live
+
+    meta_result = invoker(
+        spec=ag.meta_agent_spec,
+        ips=ips,
+        user_message=(
+            "Review the journal + calibration history. Propose ONE prompt rewrite "
+            "via propose_prompt_rewrite. Be specific about which agent's prompt "
+            "and what behavioral change you intend."
+        ),
+        session=in_sample_session,
+    )
+
+    # Did the meta-agent submit a proposal? Inspect the prompt store for any
+    # version added since meta started running.
+    store = PromptHistory.default()
+    pending: list[PromptVersion] = []
+    for agent_name in ("alpha", "portfolio", "cost_risk", "critic", "meta"):
+        latest = store.latest(agent_name)
+        if latest and not latest.promoted and not latest.rolled_back:
+            pending.append(latest)
+
+    decisions: list[PromotionDecision] = []
+    for pv in pending:
+        d = validate_prompt_rewrite(
+            pv,
+            ips=ips,
+            in_sample_session=in_sample_session,
+            holdout_session=holdout_session,
+            invoker=invoker,
+        )
+        decisions.append(d)
+
+    return {
+        "meta_result": meta_result,
+        "promotion_decisions": [
+            {
+                "version": d.version,
+                "agent": d.agent,
+                "decision": d.decision,
+                "sharpe_delta": d.sharpe_delta,
+                "bonferroni_threshold": d.bonferroni_threshold,
+                "rationale": d.rationale,
+            }
+            for d in decisions
+        ],
+    }
 
 
 # ----- save -----------------------------------------------------------------
@@ -333,20 +578,37 @@ def orchestrate(
     dry_run: bool = True,
     run_meta: bool = False,
 ) -> CycleResult:
-    """Top-level entry: load IPS, build session, run cycle, save."""
+    """Top-level entry: load IPS, build session(s), run cycle, save.
+
+    When run_meta=True, also loads a separate holdout session and runs the
+    full meta-cycle (propose → validate → promote/reject).
+    """
     ips = load_ips(ips_path)
     errs = validate_ips(ips)
     if errs:
         raise ValueError(f"IPS validation failed:\n  - " + "\n  - ".join(errs))
 
     session = None
+    holdout_session = None
     if not dry_run:
         session = load_session_for_ips(ips, limit=limit)
+        if run_meta:
+            holdout_session = load_holdout_session(ips, limit=limit)
 
     cycle = run_cycle(ips=ips, session=session, dry_run=dry_run)
+
     if run_meta:
-        meta_result = run_meta_pass(ips=ips, session=session, dry_run=dry_run)
-        cycle.agent_results["meta"] = meta_result
+        meta_result = run_meta_cycle(
+            ips=ips,
+            in_sample_session=session,
+            holdout_session=holdout_session,
+            dry_run=dry_run,
+        )
+        cycle.agent_results["meta"] = meta_result["meta_result"]
+        cycle.notes = (cycle.notes + "\n" if cycle.notes else "") + (
+            f"meta promotions: {len(meta_result['promotion_decisions'])} "
+            f"({[d['decision'] for d in meta_result['promotion_decisions']]})"
+        )
 
     save_cycle(cycle)
     return cycle
